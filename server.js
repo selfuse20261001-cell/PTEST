@@ -47,6 +47,16 @@ let uid = 1;
 const isVideoId = v => typeof v === 'string' && /^[\w-]{11}$/.test(v);
 const clean = (s, n = 120) => String(s || '').slice(0, n);
 
+// 記住電視播不出來（版權方禁止嵌入）的影片，之後搜尋自動排除、點歌時直接提醒
+const blockedPath = path.join(__dirname, 'blocked.json');
+let blocked = new Set();
+try { blocked = new Set(JSON.parse(fs.readFileSync(blockedPath, 'utf8'))); } catch {}
+function block(videoId) {
+  blocked.add(videoId);
+  fs.writeFile(blockedPath, JSON.stringify([...blocked]), () => {});
+}
+const BLOCKED_MSG = '這個版本的版權方不允許在電視上播放，請換別的頻道，或改搜「伴唱」「導唱」版本';
+
 function broadcast() { io.emit('state', state); }
 function playNext() {
   if (state.current) {
@@ -75,10 +85,11 @@ app.get('/api/search', async (req, res) => {
   if (!q) return res.json({ items: [] });
   if (!API_KEY) return res.status(400).json({ error: '尚未設定 YT_API_KEY，請在 .env 填入 YouTube API 金鑰。也可以直接貼上 YouTube 連結點歌。' });
   const hit = cache.get(q);
-  if (hit && Date.now() - hit.t < 30 * 60 * 1000) return res.json({ items: hit.items });
+  const visible = items => items.filter(it => !blocked.has(it.videoId));
+  if (hit && Date.now() - hit.t < 30 * 60 * 1000) return res.json({ items: visible(hit.items) });
   const params = new URLSearchParams({
     part: 'snippet', type: 'video', maxResults: '20', q, key: API_KEY,
-    videoEmbeddable: 'true', regionCode: 'TW', relevanceLanguage: 'zh-Hant', safeSearch: 'none'
+    videoEmbeddable: 'true', videoSyndicated: 'true', regionCode: 'TW', relevanceLanguage: 'zh-Hant', safeSearch: 'none'
   });
   try {
     const r = await fetch(`https://www.googleapis.com/youtube/v3/search?${params}`);
@@ -91,7 +102,7 @@ app.get('/api/search', async (req, res) => {
       thumb: it.snippet.thumbnails?.medium?.url || it.snippet.thumbnails?.default?.url || ''
     }));
     cache.set(q, { t: Date.now(), items });
-    res.json({ items });
+    res.json({ items: visible(items) });
   } catch (e) {
     res.status(502).json({ error: '連不到 YouTube，請確認網路。' });
   }
@@ -101,9 +112,11 @@ app.get('/api/search', async (req, res) => {
 app.get('/api/video/:id', async (req, res) => {
   const id = req.params.id;
   if (!isVideoId(id)) return res.status(400).json({ error: '連結格式不對' });
+  if (blocked.has(id)) return res.status(403).json({ error: BLOCKED_MSG });
   try {
     const r = await fetch(`https://www.youtube.com/oembed?format=json&url=https://www.youtube.com/watch?v=${id}`);
-    if (!r.ok) return res.status(404).json({ error: '找不到這部影片，或影片不開放嵌入' });
+    if (r.status === 401 || r.status === 403) { block(id); return res.status(403).json({ error: BLOCKED_MSG }); }
+    if (!r.ok) return res.status(404).json({ error: '找不到這部影片，請確認連結' });
     const j = await r.json();
     res.json({ videoId: id, title: j.title, channel: j.author_name, thumb: `https://i.ytimg.com/vi/${id}/mqdefault.jpg` });
   } catch {
@@ -117,6 +130,7 @@ io.on('connection', socket => {
 
   socket.on('add', s => {
     if (!s || !isVideoId(s.videoId)) return;
+    if (blocked.has(s.videoId)) return socket.emit('toast', BLOCKED_MSG);
     const song = {
       id: uid++, videoId: s.videoId, title: clean(s.title), channel: clean(s.channel, 60),
       thumb: clean(s.thumb, 300), by: clean(s.by, 12) || '來賓', addedAt: Date.now()
@@ -156,7 +170,9 @@ io.on('connection', socket => {
   socket.on('ended', id => { if (state.current?.id === id) playNext(); });
   socket.on('tvError', ({ id, code } = {}) => {
     if (state.current?.id !== id) return;
-    const reason = (code === 101 || code === 150) ? '版權方不允許嵌入播放' : '影片無法播放';
+    const embedBlocked = code === 101 || code === 150;
+    if (embedBlocked) block(state.current.videoId);
+    const reason = embedBlocked ? '版權方不允許在電視上播放，下次搜尋會自動排除，請改點別的版本' : '影片無法播放';
     io.emit('toast', `已跳過「${state.current.title}」：${reason}`);
     playNext();
   });

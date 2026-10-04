@@ -3,6 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="strict-origin-when-cross-origin">
 <title>家用 KTV｜電視</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <!-- 字型不擋畫面：連不到 Google 也會立刻顯示，改用系統字型 -->
@@ -109,7 +110,7 @@ fetch('/api/info').then(r => r.json()).then(i => {
 
 function onYouTubeIframeAPIReady() {
   player = new YT.Player('player', {
-    playerVars: { autoplay: 1, controls: 0, rel: 0, playsinline: 1, iv_load_policy: 3, disablekb: 1, fs: 0 },
+    playerVars: { origin: location.origin, autoplay: 1, controls: 0, rel: 0, playsinline: 1, iv_load_policy: 3, disablekb: 1, fs: 0 },
     events: {
       onReady: () => { ready = true; if (last) render(last); },
       onStateChange: e => {
