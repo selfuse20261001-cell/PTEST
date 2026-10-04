@@ -22,6 +22,16 @@ const API_KEY = process.env.YT_API_KEY || '';
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server);
+// 有裝置打開網頁就印出來：手機掃完 QR Code 這裡沒出現，代表手機連不到這台電腦
+const seen = new Set();
+app.use((req, res, next) => {
+  const ip = String(req.socket.remoteAddress || '').replace(/^::ffff:/, '');
+  if ((req.path === '/' || req.path.endsWith('.html')) && !seen.has(ip + req.path)) {
+    seen.add(ip + req.path);
+    console.log(`   📱 ${ip} 打開了 ${req.path === '/' ? '點歌頁' : req.path}`);
+  }
+  next();
+});
 app.use(express.static(path.join(__dirname, 'public')));
 
 // 虛擬網卡（VirtualBox、VMware、Hyper-V、WSL、Docker、VPN）的 IP 手機連不到，要排除
@@ -193,5 +203,7 @@ server.listen(PORT, '0.0.0.0', () => {
     for (const a of others) console.log(`     http://${a}:${PORT}/`);
   }
   if (!API_KEY) console.log('   ⚠️ 尚未設定 YT_API_KEY：只能貼 YouTube 連結點歌，不能搜尋');
+  console.log('\n   手機掃完 QR Code 後，這裡應該會出現「📱 … 打開了 點歌頁」。');
+  console.log('   沒出現 = 手機連不到這台電腦：Windows 請雙擊 fix-firewall.bat，並確認手機連的是同一個 Wi-Fi。');
   console.log('');
 });
