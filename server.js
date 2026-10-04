@@ -13,7 +13,7 @@ const envPath = path.join(__dirname, '.env');
 if (fs.existsSync(envPath)) {
   for (const line of fs.readFileSync(envPath, 'utf8').split(/\r?\n/)) {
     const m = line.match(/^\s*([A-Z_]+)\s*=\s*(.*)\s*$/);
-    if (m && !process.env[m[1]]) process.env[m[1]] = m[2].replace(/^["']|["']$/g, '');
+    if (m && !process.env[m[1]]) process.env[m[1]] = m[2].trim().replace(/^["']|["']$/g, '');
   }
 }
 const PORT = Number(process.env.PORT) || 3000;
@@ -144,9 +144,9 @@ io.on('connection', socket => {
   });
 
   // 以下由電視端回報
-  socket.on('ended', videoId => { if (state.current?.videoId === videoId) playNext(); });
-  socket.on('tvError', ({ videoId, code }) => {
-    if (state.current?.videoId !== videoId) return;
+  socket.on('ended', id => { if (state.current?.id === id) playNext(); });
+  socket.on('tvError', ({ id, code } = {}) => {
+    if (state.current?.id !== id) return;
     const reason = (code === 101 || code === 150) ? '版權方不允許嵌入播放' : '影片無法播放';
     io.emit('toast', `已跳過「${state.current.title}」：${reason}`);
     playNext();

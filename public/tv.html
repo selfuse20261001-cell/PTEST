@@ -116,7 +116,7 @@ function onYouTubeIframeAPIReady() {
         if (e.data === YT.PlayerState.PLAYING) socket.emit('tvPlaying', true);
         if (e.data === YT.PlayerState.PAUSED) socket.emit('tvPlaying', false);
       },
-      onError: e => socket.emit('tvError', { videoId: loaded, code: e.data })
+      onError: e => socket.emit('tvError', { id: loaded, code: e.data })
     }
   });
 }
@@ -138,8 +138,8 @@ function render(s) {
 
   if (!ready || !started) return;
   if (!cur) { if (loaded) { player.stopVideo(); loaded = null; } return; }
-  if (cur.videoId !== loaded) {
-    loaded = cur.videoId;
+  if (cur.id !== loaded) {
+    loaded = cur.id;
     player.setVolume(s.volume);
     player.loadVideoById(cur.videoId);
     showBar();
