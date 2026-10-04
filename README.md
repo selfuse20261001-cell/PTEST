@@ -5,6 +5,12 @@
 - **電視**：瀏覽器開 `tv.html`，全螢幕播放 YouTube KTV 影片
 - **手機**：掃電視上的 QR Code → 搜尋、點歌、插播、切歌、音量、收藏
 
+## 最快的方式
+- **Windows**：先安裝 Node.js（https://nodejs.org ，選 LTS），再雙擊 `start.bat`
+- **macOS / Linux**：在終端機執行 `./start.sh`
+
+第一次會自動安裝套件、建立 `.env`。想用搜尋功能再把金鑰填進 `.env`。
+
 ## 安裝（約 10 分鐘）
 1. 安裝 Node.js 18 以上：https://nodejs.org
 2. 在這個資料夾執行：`npm install`
