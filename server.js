@@ -24,13 +24,22 @@ const server = http.createServer(app);
 const io = new Server(server);
 app.use(express.static(path.join(__dirname, 'public')));
 
-function lanIP() {
-  const all = [];
-  for (const list of Object.values(os.networkInterfaces())) {
-    for (const i of list || []) if (i.family === 'IPv4' && !i.internal) all.push(i.address);
+// 虛擬網卡（VirtualBox、VMware、Hyper-V、WSL、Docker、VPN）的 IP 手機連不到，要排除
+const VIRTUAL = /virtual|vmware|vbox|hyper-v|vethernet|wsl|docker|br-|veth|tailscale|zerotier|vpn|tun|tap|utun/i;
+function lanIPs() {
+  const real = [], virt = [];
+  for (const [name, list] of Object.entries(os.networkInterfaces())) {
+    for (const i of list || []) {
+      if (i.family !== 'IPv4' && i.family !== 4) continue;
+      if (i.internal || i.address.startsWith('169.254.')) continue;
+      (VIRTUAL.test(name) || i.address === '192.168.56.1' ? virt : real).push(i.address);
+    }
   }
-  return all.find(a => a.startsWith('192.168.')) || all.find(a => a.startsWith('10.')) || all[0] || 'localhost';
+  const rank = a => a.startsWith('192.168.') ? 0 : a.startsWith('10.') ? 1 : a.startsWith('172.') ? 2 : 3;
+  return [...real.sort((a, b) => rank(a) - rank(b)), ...virt];
 }
+// 自動抓錯時，可在 .env 寫 HOST_IP=192.168.x.x 指定
+function lanIP() { return process.env.HOST_IP || lanIPs()[0] || 'localhost'; }
 
 // ---- 共用狀態 ----
 const state = { queue: [], current: null, playing: false, volume: 80, history: [] };
@@ -162,6 +171,11 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log('\n🎤 家用 KTV 已啟動');
   console.log(`   電視開：http://${ip}:${PORT}/tv.html`);
   console.log(`   手機開：http://${ip}:${PORT}/  （或掃電視上的 QR Code）`);
+  const others = lanIPs().filter(a => a !== ip);
+  if (others.length) {
+    console.log('   手機打不開的話，換這些網址試試看（找到能開的，在 .env 寫 HOST_IP=那個IP）：');
+    for (const a of others) console.log(`     http://${a}:${PORT}/`);
+  }
   if (!API_KEY) console.log('   ⚠️ 尚未設定 YT_API_KEY：只能貼 YouTube 連結點歌，不能搜尋');
   console.log('');
 });
