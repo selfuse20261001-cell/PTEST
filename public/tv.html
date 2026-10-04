@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>家用 KTV｜電視</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Huninn&family=Noto+Sans+TC:wght@400;700;900&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --room: #1B1033; --panel: #2A1B4D; --neon: #FF4FA3; --amber: #FFC24B;
+    --text: #F5EEFF; --muted: #A99BC8;
+    --round: "Huninn", "Noto Sans TC", "PingFang TC", "Microsoft JhengHei", sans-serif;
+    --body: "Noto Sans TC", "PingFang TC", "Microsoft JhengHei", sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  html, body { height: 100%; background: #000; color: var(--text); font-family: var(--body); overflow: hidden; cursor: none; }
+
+  #player-wrap { position: fixed; inset: 0; }
+  #player-wrap iframe { width: 100%; height: 100%; border: 0; }
+
+  /* 待機畫面 */
+  #idle { position: fixed; inset: 0; background: radial-gradient(ellipse at 30% 20%, #3A2170 0%, var(--room) 60%);
+    display: grid; grid-template-columns: 1.3fr 1fr; align-items: center; gap: 6vw; padding: 0 8vw; }
+  #idle h1 { font-family: var(--round); font-weight: 400; font-size: 9vw; line-height: 1.05; color: var(--neon);
+    text-shadow: 0 0 .15em rgba(255,79,163,.7), 0 0 .6em rgba(255,79,163,.35); }
+  #idle p { margin-top: 2.5vw; font-size: 2vw; color: var(--muted); line-height: 1.6; }
+  #idle p b { color: var(--amber); font-weight: 700; }
+  .qr-card { background: #fff; border-radius: 2vw; padding: 1.6vw; justify-self: start; text-align: center; }
+  .qr-card img { width: 24vw; height: 24vw; display: block; }
+  .qr-card span { display: block; margin-top: .8vw; color: var(--room); font-size: 1.3vw; font-weight: 700; }
+
+  /* 播放中：下方點歌條 */
+  #bar { position: fixed; left: 0; right: 0; bottom: 0; display: flex; align-items: stretch;
+    background: linear-gradient(0deg, rgba(27,16,51,.96), rgba(27,16,51,.82)); border-top: 3px solid var(--neon);
+    transform: translateY(100%); transition: transform .4s ease; }
+  #bar.show { transform: none; }
+  .now, .next { padding: 1vw 2vw; min-width: 0; }
+  .now { flex: 1.2; border-right: 1px solid rgba(255,255,255,.12); }
+  .next { flex: 1; }
+  .bar-label { font-size: 1.1vw; color: var(--muted); }
+  .bar-title { font-family: var(--round); font-size: 2vw; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: .2vw; }
+  .now .bar-title { color: var(--amber); }
+  .bar-by { font-size: 1.1vw; color: var(--muted); margin-top: .2vw; }
+  .bar-qr { background: #fff; padding: .5vw; display: flex; align-items: center; }
+  .bar-qr img { width: 6.5vw; height: 6.5vw; display: block; }
+
+  #toast { position: fixed; top: 3vw; right: 3vw; max-width: 45vw; background: var(--neon); color: #fff;
+    font-size: 1.6vw; font-weight: 700; padding: 1vw 1.6vw; border-radius: 1vw;
+    opacity: 0; transform: translateY(-1vw); transition: .3s; pointer-events: none; }
+  #toast.show { opacity: 1; transform: none; }
+
+  /* 首次啟動（瀏覽器需要按一次才能自動播放有聲影片） */
+  #gate { position: fixed; inset: 0; background: var(--room); display: grid; place-items: center; z-index: 10; }
+  #gate button { font-family: var(--round); font-size: 3vw; background: var(--neon); color: #fff; border: 0;
+    border-radius: 99px; padding: 1.4vw 4vw; cursor: pointer; }
+  #gate button:focus { outline: .4vw solid var(--amber); outline-offset: .6vw; }
+  #gate p { text-align: center; color: var(--muted); font-size: 1.5vw; margin-top: 2vw; }
+  .hidden { display: none !important; }
+  @media (prefers-reduced-motion: reduce) { #bar, #toast { transition: none; } }
+</style>
+</head>
+<body>
+  <div id="player-wrap"><div id="player"></div></div>
+
+  <section id="idle">
+    <div>
+      <h1>今晚，<br>唱一首吧</h1>
+      <p>手機掃右邊的 QR Code 開始點歌。<br>大家用自己的手機點，歌會依序排隊播放。<br>連不上的話，確認手機和電視在<b>同一個 Wi-Fi</b>。</p>
+    </div>
+    <div class="qr-card"><img id="qr-big" alt="點歌 QR Code"><span id="url"></span></div>
+  </section>
+
+  <footer id="bar">
+    <div class="now">
+      <div class="bar-label">正在唱</div>
+      <div class="bar-title" id="now-title"></div>
+      <div class="bar-by" id="now-by"></div>
+    </div>
+    <div class="next">
+      <div class="bar-label" id="next-label">下一首</div>
+      <div class="bar-title" id="next-title"></div>
+      <div class="bar-by" id="next-by"></div>
+    </div>
+    <div class="bar-qr"><img id="qr-small" alt="點歌 QR Code"></div>
+  </footer>
+
+  <div id="toast"></div>
+
+  <div id="gate">
+    <div>
+      <button id="start" autofocus>開始</button>
+      <p>按遙控器的 OK 鍵開始（電視瀏覽器需要按一次才能播放聲音）</p>
+    </div>
+  </div>
+
+<script src="/socket.io/socket.io.js"></script>
+<script src="https://www.youtube.com/iframe_api"></script>
+<script>
+const socket = io();
+const $ = id => document.getElementById(id);
+let player, ready = false, started = false, loaded = null, last = null, barTimer;
+
+fetch('/api/info').then(r => r.json()).then(i => {
+  $('qr-big').src = $('qr-small').src = i.qr;
+  $('url').textContent = i.url.replace('http://', '');
+});
+
+function onYouTubeIframeAPIReady() {
+  player = new YT.Player('player', {
+    playerVars: { autoplay: 1, controls: 0, rel: 0, playsinline: 1, iv_load_policy: 3, disablekb: 1, fs: 0 },
+    events: {
+      onReady: () => { ready = true; if (last) render(last); },
+      onStateChange: e => {
+        if (e.data === YT.PlayerState.ENDED) socket.emit('ended', loaded);
+        if (e.data === YT.PlayerState.PLAYING) socket.emit('tvPlaying', true);
+        if (e.data === YT.PlayerState.PAUSED) socket.emit('tvPlaying', false);
+      },
+      onError: e => socket.emit('tvError', { videoId: loaded, code: e.data })
+    }
+  });
+}
+
+function showBar() {
+  $('bar').classList.add('show');
+  clearTimeout(barTimer);
+  barTimer = setTimeout(() => $('bar').classList.remove('show'), 12000);
+}
+
+function render(s) {
+  last = s;
+  const cur = s.current, nxt = s.queue[0];
+  $('idle').classList.toggle('hidden', !!cur);
+  $('now-title').textContent = cur ? cur.title : '';
+  $('now-by').textContent = cur ? `${cur.by} 點播` : '';
+  $('next-title').textContent = nxt ? nxt.title : '還沒有人點歌';
+  $('next-by').textContent = nxt ? `${nxt.by} 點播` + (s.queue.length > 1 ? `｜後面還有 ${s.queue.length - 1} 首` : '') : '';
+
+  if (!ready || !started) return;
+  if (!cur) { if (loaded) { player.stopVideo(); loaded = null; } return; }
+  if (cur.videoId !== loaded) {
+    loaded = cur.videoId;
+    player.setVolume(s.volume);
+    player.loadVideoById(cur.videoId);
+    showBar();
+  }
+}
+
+socket.on('state', render);
+socket.on('cmd', c => {
+  if (!ready) return;
+  if (c.type === 'play') player.playVideo();
+  if (c.type === 'pause') { player.pauseVideo(); showBar(); }
+  if (c.type === 'restart') player.seekTo(0, true);
+  if (c.type === 'volume') player.setVolume(c.value);
+});
+socket.on('toast', msg => {
+  const t = $('toast');
+  t.textContent = msg; t.classList.add('show');
+  clearTimeout(t._h); t._h = setTimeout(() => t.classList.remove('show'), 4000);
+  if (last?.current) showBar();
+});
+
+// 每秒回報進度給手機
+setInterval(() => {
+  if (ready && loaded && player.getDuration) {
+    socket.emit('progress', { t: player.getCurrentTime() || 0, d: player.getDuration() || 0 });
+  }
+}, 1000);
+
+$('start').onclick = () => {
+  started = true;
+  $('gate').classList.add('hidden');
+  document.documentElement.requestFullscreen?.().catch(() => {});
+  if (last) render(last);
+};
+
+// 遙控器快捷鍵
+document.addEventListener('keydown', e => {
+  if (!started) return;
+  if (['MediaPlayPause', 'Enter', ' '].includes(e.key)) socket.emit('toggle');
+  if (['MediaTrackNext', 'MediaFastForward'].includes(e.key)) socket.emit('skip');
+  if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.key)) showBar();
+});
+</script>
+</body>
+</html>
