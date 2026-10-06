@@ -1,0 +1,373 @@
+"""Flask application entry point and server initialization."""
+
+import subprocess as _stdlib_subprocess  # Before monkey patching
+
+_stdlib_subprocess_run = _stdlib_subprocess.run
+
+from gevent import monkey, spawn
+
+monkey.patch_all()
+
+import datetime
+import logging
+import os
+import sys
+from pathlib import Path
+from urllib.parse import quote, urlsplit
+
+import flask_babel
+from flask import Flask, request, session
+from flask_babel import Babel
+from flask_socketio import SocketIO
+
+from pikaraoke import VERSION, karaoke
+from pikaraoke.constants import LANGUAGES
+from pikaraoke.lib.admin_auth import AdminAuth
+from pikaraoke.lib.args import parse_pikaraoke_args
+from pikaraoke.lib.auth import document_auth, install_auth_gate
+from pikaraoke.lib.browser import Browser
+from pikaraoke.lib.current_app import get_karaoke_instance, is_admin
+from pikaraoke.lib.ffmpeg import is_ffmpeg_installed
+from pikaraoke.lib.file_resolver import delete_tmp_dir
+from pikaraoke.lib.get_platform import get_platform, has_js_runtime, is_windows
+from pikaraoke.lib.song_manager import SongManager
+from pikaraoke.lib.url_prefix import BasePathMiddleware
+from pikaraoke.lib.youtube_dl import upgrade_youtubedl
+from pikaraoke.routes import API_BLUEPRINTS, INTERNAL_BLUEPRINTS
+from pikaraoke.routes.socket_events import setup_socket_events
+
+_ = flask_babel.gettext
+
+from gevent.pywsgi import WSGIServer
+
+args = parse_pikaraoke_args()
+socketio_path = f"{args.base_path}/socket.io" if args.base_path else "/socket.io"
+# Setting cors_allowed_origins REPLACES engineio's same-origin default, so --url alone
+# locks out the kiosk browser on loopback ("is not an accepted origin"). Origin headers
+# never carry a path, hence the normalise.
+cors_allowed_origins = None
+if args.url:
+    split_url = urlsplit(args.url)
+    cors_allowed_origins = [
+        f"{split_url.scheme}://{split_url.netloc}",
+        f"http://localhost:{args.port}",
+        f"http://127.0.0.1:{args.port}",
+        f"http://[::1]:{args.port}",
+    ]
+socketio = SocketIO(
+    async_mode="gevent", cors_allowed_origins=cors_allowed_origins, path=socketio_path
+)
+babel = Babel()
+
+
+app = Flask(__name__)
+
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+# Not SESSION_COOKIE_SECURE: on plain HTTP the browser would never send it back.
+app.permanent_session_lifetime = datetime.timedelta(days=90)
+app.jinja_env.add_extension("jinja2.ext.i18n")
+app.config["BABEL_TRANSLATION_DIRECTORIES"] = "translations"
+app.config["JSON_SORT_KEYS"] = False
+app.config["APPLICATION_ROOT"] = args.base_path or "/"
+app.config["SESSION_COOKIE_PATH"] = args.base_path or "/"
+app.config["PIKARAOKE_BASE_PATH"] = args.base_path
+app.config["PIKARAOKE_SOCKETIO_PATH"] = socketio_path
+app.wsgi_app = BasePathMiddleware(app.wsgi_app, args.base_path)
+
+# Globals rather than per-route template args, so every page that extends
+# base.html agrees: it gates the admin-only nav links on is_admin and renders a
+# session ribbon from active_session_name, and singer_field gates KJ mode on
+# has_active_session. Registered at import rather than in main() -- base.html
+# calls them on every render, so binding them any later leaves a render path
+# that fails on an undefined name. The Karaoke instance is resolved per call
+# because it does not exist yet at import time.
+app.jinja_env.globals.update(
+    is_admin=is_admin,
+    active_session_name=lambda: get_karaoke_instance().play_history.get_current_session_name(),
+    has_active_session=lambda: get_karaoke_instance().play_history.has_active_session(),
+)
+
+# Always initialize flask-smorest Api for error handling (@bp.arguments validation).
+# Only expose the Swagger UI when --enable-swagger is passed.
+from flask_smorest import Api
+
+app.config["API_TITLE"] = "PiKaraoke API"
+app.config["API_VERSION"] = VERSION
+app.config["OPENAPI_VERSION"] = "3.0.2"
+app.config["OPENAPI_URL_PREFIX"] = "/"
+
+if args.enable_swagger:
+    app.config["OPENAPI_SWAGGER_UI_PATH"] = "/apidocs"
+    app.config["OPENAPI_SWAGGER_UI_URL"] = "https://cdn.jsdelivr.net/npm/swagger-ui-dist/"
+
+api = Api(app)
+
+for bp in API_BLUEPRINTS:
+    api.register_blueprint(bp)
+
+for bp in INTERNAL_BLUEPRINTS:
+    app.register_blueprint(bp)
+
+# After registration, so every endpoint the gate reads exists.
+install_auth_gate(app)
+document_auth(app, api)
+
+
+def get_locale() -> str | None:
+    """Select the language to display based on user preference or Accept-Language header.
+
+    Returns:
+        Language code string (e.g., 'en', 'fr') or None.
+    """
+    # Check config.ini lang settings (if karaoke instance is initialized)
+    try:
+        k = get_karaoke_instance()
+        preferred_lang = k.preferences.get_or_default("preferred_language")
+        if preferred_lang and preferred_lang in LANGUAGES.keys():
+            return preferred_lang
+    except (RuntimeError, AttributeError):
+        # App context not available or karaoke instance not initialized yet
+        pass
+
+    # Check URL arguments
+    if request.args.get("lang"):
+        session["lang"] = request.args.get("lang")
+        locale = session.get("lang", "en")
+    # Use browser header
+    else:
+        locale = request.accept_languages.best_match(LANGUAGES.keys())
+
+    # An unknown code (a stale session cookie, a hand-edited ?lang=) makes Babel raise
+    # UnknownLocaleError on every render, so never hand one back.
+    return locale if locale in LANGUAGES else None
+
+
+@app.context_processor
+def inject_path_config() -> dict[str, str]:
+    """Expose path-prefix settings to templates."""
+    return {
+        "base_path": app.config["PIKARAOKE_BASE_PATH"],
+        "socketio_path": app.config["PIKARAOKE_SOCKETIO_PATH"],
+        "cookie_path": app.config["SESSION_COOKIE_PATH"],
+    }
+
+
+babel.init_app(app, locale_selector=get_locale)
+socketio.init_app(app)
+setup_socket_events(socketio)
+
+
+def compile_translations() -> None:
+    """Compile .po translation files to .mo binary format if needed.
+
+    Uses _stdlib_subprocess_run (saved before monkey patching) because this runs
+    before the gevent event loop is active — the patched version deadlocks here.
+    """
+    translations_dir = Path(__file__).parent / "translations"
+    if not translations_dir.exists():
+        return
+
+    # Check if any .po file is newer than its .mo counterpart
+    needs_compile = False
+    for po_file in translations_dir.rglob("*.po"):
+        mo_file = po_file.with_suffix(".mo")
+        if not mo_file.exists() or po_file.stat().st_mtime > mo_file.stat().st_mtime:
+            needs_compile = True
+            break
+
+    if not needs_compile:
+        return
+
+    print("Compiling translation files...")
+    result = _stdlib_subprocess_run(
+        [
+            sys.executable,
+            "-m",
+            "babel.messages.frontend",
+            "compile",
+            "-f",
+            "-d",
+            str(translations_dir),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        print(f"Failed to compile translations: {result.stderr}")
+    else:
+        print("Translations compiled successfully")
+
+
+def main() -> None:
+    """Main entry point for the PiKaraoke application.
+
+    Initializes the Flask server, Karaoke engine, and splash screen.
+    Blocks until the application is terminated.
+    """
+    compile_translations()
+    platform = get_platform()
+
+    args = parse_pikaraoke_args()
+
+    # --- LOGGING SETUP ---
+    # Optional: Force the log file to go to AppData too, so you can debug installation issues
+    # log_path = os.path.join(get_data_directory(), 'pikaraoke.log')
+    # logging.basicConfig(filename=log_path, level=logging.INFO)
+
+    if not is_ffmpeg_installed():
+        logging.error(
+            "ffmpeg is not installed, which is required to run PiKaraoke. See: https://www.ffmpeg.org/"
+        )
+        sys.exit(1)
+
+    if not has_js_runtime():
+        logging.warning(
+            "No js runtime is installed (such as Deno, Bun, Node.js, or QuickJS). This is required to run yt-dlp. Some downloads may not work. See: https://github.com/yt-dlp/yt-dlp/wiki/EJS"
+        )
+
+    # setup/create download directory if necessary
+    if not os.path.exists(args.download_path):
+        print("Creating download path: " + args.download_path)
+        os.makedirs(args.download_path)
+
+    # Configure karaoke process
+    k = karaoke.Karaoke(
+        port=args.port,
+        download_path=args.download_path,
+        youtubedl_proxy=args.youtubedl_proxy,
+        splash_delay=args.splash_delay,
+        log_level=args.log_level,
+        volume=args.volume,
+        normalize_audio=args.normalize_audio,
+        complete_transcode_before_play=args.complete_transcode_before_play,
+        buffer_size=args.buffer_size,
+        hide_url=args.hide_url,
+        hide_qr_code=args.hide_qr_code,
+        hide_session_name=args.hide_session_name,
+        hide_logo=args.hide_logo,
+        hide_notifications=args.hide_notifications,
+        hide_splash_screen=args.hide_splash_screen,
+        high_quality=args.high_quality,
+        logo_path=args.logo_path,
+        hide_overlay=args.hide_overlay,
+        keep_awake=args.keep_awake,
+        show_splash_clock=args.show_splash_clock,
+        splash_scale=args.splash_scale,
+        url=args.url,
+        prefer_hostname=args.prefer_hostname,
+        disable_bg_music=args.disable_bg_music,
+        bg_music_volume=args.bg_music_volume,
+        bg_music_path=args.bg_music_path,
+        disable_bg_video=args.disable_bg_video,
+        bg_video_path=args.bg_video_path,
+        disable_score=args.disable_score,
+        enable_mic_passthrough=args.enable_mic_passthrough,
+        limit_user_songs_by=args.limit_user_songs_by,
+        enable_fair_queue=args.enable_fair_queue,
+        avsync=float(args.avsync) if args.avsync is not None else None,
+        config_file_path=args.config_file_path,
+        cdg_pixel_scaling=args.cdg_pixel_scaling,
+        enable_folder_browsing=args.enable_folder_browsing,
+        streaming_format=args.streaming_format,
+        additional_ytdl_args=getattr(args, "ytdl_args", None),
+        socketio=socketio,
+        preferred_language=args.preferred_language,
+        url_base_path=args.base_path,
+    )
+
+    # expose karaoke object to the flask app
+    with app.app_context():
+        app.config["KARAOKE_INSTANCE"] = k
+
+    # Wire download events to SocketIO broadcasts with app context
+    from pikaraoke.lib.current_app import broadcast_event
+
+    def _broadcast_in_context(event_name):
+        def handler():
+            with app.app_context():
+                broadcast_event(event_name)
+
+        return handler
+
+    k.events.on("download_started", _broadcast_in_context("download_started"))
+    k.events.on("download_stopped", _broadcast_in_context("download_stopped"))
+
+    admin_auth = AdminAuth(k.preferences)
+    app.secret_key = admin_auth.secret_key
+    app.config["ADMIN_AUTH"] = admin_auth
+
+    # Passing the flag persists it; omitting it keeps the stored one, empty clears it.
+    if args.admin_password is not None:
+        admin_auth.set_password(args.admin_password)
+
+    if not admin_auth.is_password_set():
+        logging.info(
+            "No admin password set: everyone on the network can control playback and "
+            "shut down the system. Set one on the info page."
+        )
+
+    # expose shared configuration variables to the flask app
+    app.config["SITE_NAME"] = "PiKaraoke"
+
+    # Expose some functions to jinja templates. The session globals are bound at
+    # import instead; these two need the Karaoke instance, which only exists here.
+    app.jinja_env.globals.update(
+        filename_from_path=k.song_manager.display_name_from_path,
+        url_escape=quote,
+    )
+
+    if not args.skip_youtubedl_upgrade:
+        spawn(upgrade_youtubedl)
+    else:
+        logging.info("Skipping yt-dlp upgrade on startup")
+
+    # Pre-populate SERVER_NAME so gevent's pywsgi skips the reverse-DNS (getfqdn)
+    # lookup it otherwise runs at startup, which can hang for a long time on hosts
+    # without working reverse DNS (observed hanging PiKaraoke launch on macOS).
+    server = WSGIServer(
+        ("0.0.0.0", int(args.port)),
+        app,
+        log=None,
+        error_log=logging.getLogger(),
+        environ={"SERVER_NAME": k.ip},
+    )
+    server.start()
+
+    # Handle sigterm, apparently cherrypy won't shut down without explicit handling
+    # signal.signal(signal.SIGTERM, lambda signum, stack_frame: k.stop())
+
+    # force headless mode when on Android
+    if (platform == "android") and not args.hide_splash_screen:
+        args.hide_splash_screen = True
+        logging.info("Forced to run headless mode in Android")
+
+    # Start the splash screen browser
+    if not args.hide_splash_screen:
+        browser = Browser(k, args.window_size, args.external_monitor)
+        browser.launch_splash_screen()
+        if not browser:
+            logging.error("Failed to launch splash screen browser")
+            sys.exit()
+    else:
+        browser = None
+
+    if args.enable_swagger:
+        logging.info(f"Swagger API docs enabled at {k.url}/apidocs")
+
+    # Start the karaoke process
+    k.run()
+
+    # Close running browser when done
+    if browser is not None:
+        browser.close()
+
+    # Ctrl-C leaves the run loop without going through stop().
+    k.stop()
+
+    delete_tmp_dir()
+    sys.exit()
+
+
+if __name__ == "__main__":
+    main()

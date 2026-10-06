@@ -1,0 +1,329 @@
+"""Playback controller for managing video playback state and coordination."""
+
+import logging
+import os
+import time
+from typing import TYPE_CHECKING, Callable
+
+from flask_babel import _
+
+from pikaraoke.lib.events import EventSystem
+from pikaraoke.lib.file_resolver import delete_tmp_dir
+from pikaraoke.lib.preference_manager import PreferenceManager
+from pikaraoke.lib.stream_manager import PlaybackResult, StreamManager
+
+if TYPE_CHECKING:
+    import subprocess
+
+# How long past its duration a song may run before the server ends it. Covers the
+# score screen, which holds the player's end report for about 15s, and a slow
+# start; late is harmless, early cuts a song.
+OVERRUN_MARGIN_S = 30
+
+
+class PlaybackController:
+    """Controller for managing playback state and stream coordination.
+
+    Owns all "now playing" state and coordinates with StreamManager for
+    FFmpeg transcoding and playback.
+
+    Attributes:
+        now_playing: Title of the currently playing song.
+        now_playing_filename: File path of the currently playing song.
+        now_playing_user: User who queued the current song.
+        now_playing_transpose: Semitones to transpose current song.
+        now_playing_duration: Duration of current song in seconds.
+        now_playing_url: Stream URL for current song.
+        now_playing_subtitle_url: URL path for subtitles.
+        now_playing_position: Current playback position in seconds.
+        playback_id: Stream uid of the current playback, None when nothing is loaded.
+        is_paused: Whether playback is paused.
+        is_playing: Whether a song is currently playing.
+        ffmpeg_process: Currently running FFmpeg subprocess.
+    """
+
+    now_playing: str | None = None
+    now_playing_filename: str | None = None
+    now_playing_user: str | None = None
+    now_playing_transpose: int = 0
+    now_playing_duration: int | None = None
+    now_playing_url: str | None = None
+    now_playing_subtitle_url: str | None = None
+    now_playing_position: float | None = None
+    playback_id: str | None = None
+    is_paused: bool = True
+    is_playing: bool = False
+    _deadline: float | None = None
+    _paused_at: float | None = None
+
+    def __init__(
+        self,
+        preferences: PreferenceManager,
+        events: EventSystem,
+        filename_from_path: Callable[[str, bool], str],
+        streaming_format: str = "hls",
+        base_path: str = "",
+    ) -> None:
+        """Initialize the playback controller.
+
+        Args:
+            preferences: PreferenceManager instance for configuration.
+            events: EventSystem instance for event emission.
+            filename_from_path: Function to extract display name from path.
+            streaming_format: Video streaming format ('hls' or 'mp4').
+            base_path: URL path prefix when PiKaraoke is hosted under a subpath.
+        """
+        self.preferences = preferences
+        self.events = events
+        self.filename_from_path = filename_from_path
+        self.stream_manager = StreamManager(preferences, streaming_format, base_path)
+
+    @property
+    def ffmpeg_process(self) -> "subprocess.Popen | None":
+        """Get the current FFmpeg process."""
+        return self.stream_manager.ffmpeg_process
+
+    def play_file(self, file_path: str, user: str, semitones: int = 0) -> PlaybackResult:
+        """Start playback of a media file.
+
+        Blocks until client connects or timeout occurs.
+
+        Args:
+            file_path: Path to the media file to play.
+            user: User who queued the song.
+            semitones: Number of semitones to transpose (0 = no change).
+
+        Returns:
+            PlaybackResult with success status and stream information.
+        """
+        if not os.path.isfile(file_path):
+            error_msg = _("Song file not found: %s") % file_path
+            logging.warning(error_msg)
+            self.now_playing_filename = None
+            return PlaybackResult(success=False, error=error_msg)
+
+        logging.info(
+            f"Playing file: {file_path} for user: {user}, transposed {semitones} semitones"
+        )
+
+        self.claim(file_path)
+
+        result = self.stream_manager.play_file(file_path, semitones)
+
+        if not result.success:
+            self.now_playing_filename = None
+            return result
+
+        self.playback_id = result.stream_uid
+        self.now_playing = self.filename_from_path(file_path, remove_youtube_id=True)
+        self.now_playing_user = user
+        self.now_playing_transpose = semitones
+        self.now_playing_duration = result.duration
+        self.now_playing_url = result.stream_url
+        self.now_playing_subtitle_url = result.subtitle_url
+        self.is_paused = False
+
+        self.events.emit("playback_started")
+
+        # Wait for client to connect
+        max_retries = 100
+        while not self.is_playing and max_retries > 0:
+            time.sleep(0.1)
+            max_retries -= 1
+
+        if not self.is_playing:
+            error_msg = _("Stream was not playable! Skipping track")
+            logging.error(error_msg)
+            self.end_song("timeout", self.playback_id)
+            return PlaybackResult(success=False, error=error_msg)
+
+        logging.debug("Stream is playing")
+        return result
+
+    def claim(self, file_path: str) -> None:
+        """Mark a file as the one playback owns, before any of it is read.
+
+        This field is what tells a rename request the file is spoken for, so it
+        must be set before the first yield point: play_file() sleeps through
+        transcoding and gevent serves HTTP requests during those sleeps.
+        """
+        self.now_playing_filename = file_path
+
+    def _is_current_playback(self, playback_id: str | None) -> bool:
+        """Whether a report names the playback that is loaded right now.
+
+        A report that cannot name one is not actionable, so a splash left open
+        across an upgrade is ignored until it reloads.
+        """
+        return self.playback_id is not None and playback_id == self.playback_id
+
+    def start_song(self, playback_id: str | None) -> None:
+        """Mark the current song as actively playing.
+
+        Called when a player connects to the stream, over HTTP or the socket.
+        Idempotent - safe to call multiple times.
+
+        Args:
+            playback_id: Playback the player is reporting on. A report for any
+                other playback is ignored, so a player announcing a song after
+                it has already ended cannot resurrect the "playing" state.
+        """
+        if not self._is_current_playback(playback_id):
+            logging.debug(f"Ignoring start_song for playback {playback_id}")
+            return
+        if not self.is_playing:
+            logging.info(f"Song starting: {self.now_playing}")
+            self.is_playing = True
+            self._arm_deadline()
+
+    def _arm_deadline(self) -> None:
+        """Start the clock the server ends the song by if no player reports it.
+
+        The player's end report is the only other way out of a song, and the
+        player is a browser tab the OS may suspend, so the server keeps its own.
+        """
+        self._paused_at = None
+        if not self.now_playing_duration:
+            logging.warning(f"No duration for {self.now_playing}, so no deadline to end it by")
+            self._deadline = None
+            return
+        self._deadline = time.monotonic() + self.now_playing_duration + OVERRUN_MARGIN_S
+
+    def end_if_overran(self) -> None:
+        """End the song if it has outlived its deadline with no player ending it."""
+        if self._deadline is None or self._paused_at is not None:
+            return
+        if time.monotonic() > self._deadline:
+            logging.warning(f"No end reported for {self.now_playing}, ending it")
+            self.end_song("no end reported", self.playback_id)
+
+    def restart(self) -> None:
+        """Play the current song again from the top, so its deadline starts over."""
+        self.is_paused = False
+        self._arm_deadline()
+
+    def end_song(self, reason: str | None, playback_id: str | None) -> None:
+        """End the current song and clean up resources.
+
+        Args:
+            reason: Reason for ending (e.g., 'complete', 'skip', 'timeout').
+            playback_id: Playback being ended. A request for any other playback
+                is ignored, so a player reporting on a song that has already
+                ended cannot tear down its successor. Server-initiated endings
+                pass the current id.
+        """
+        if not self._is_current_playback(playback_id):
+            logging.debug(f"Ignoring end_song ({reason}) for playback {playback_id}")
+            return
+
+        logging.info(f"Song ending: {self.now_playing}")
+        # Claim the playback before anything that yields to another greenlet, so
+        # a second caller arriving mid-cleanup is rejected by the guard above.
+        self.reset_now_playing()
+
+        if reason:
+            logging.info(f"Reason: {reason}")
+            if reason not in ("complete", "skip", "transpose"):
+                # MSG: Message shown when the song ends abnormally
+                self.events.emit("notification", _("Song ended abnormally: %s") % reason, "danger")
+
+        self.stream_manager.kill_ffmpeg()
+        # Small delay to ensure FFmpeg fully terminates and file handles close
+        # Critical on Raspberry Pi with slow SD cards and hardware encoder cleanup
+        time.sleep(0.3)
+        delete_tmp_dir()
+        logging.debug("Cleanup complete")
+
+        self.events.emit("song_ended", reason)
+
+    def skip(self, log_action: bool = True, reason: str = "skip") -> bool:
+        """Skip the currently playing song.
+
+        Args:
+            log_action: Whether to log and notify about the skip.
+            reason: End reason passed to listeners. Callers that end the stream
+                without ending the performance (a transpose restarts the same
+                song in a new key) pass their own, so play history can tell the
+                difference between a real skip and a restart.
+
+        Returns:
+            True if a song was skipped, False if nothing playing.
+        """
+        if self.is_playing:
+            if log_action:
+                # MSG: Message shown after the song is skipped, will be followed by song name
+                self.events.emit("notification", _("Skip: %s") % self.now_playing, "info")
+            self.end_song(reason, self.playback_id)
+            return True
+        else:
+            logging.warning("Tried to skip, but no file is playing!")
+            return False
+
+    def pause(self) -> bool:
+        """Toggle pause state of the current song.
+
+        Returns:
+            True if successful, False if nothing playing.
+        """
+        if self.is_playing:
+            if self.is_paused:
+                # MSG: Message shown after the song is resumed, will be followed by song name
+                self.events.emit("notification", _("Resume: %s") % self.now_playing, "info")
+            else:
+                # MSG: Message shown after the song is paused, will be followed by song name
+                self.events.emit("notification", _("Pause: %s") % self.now_playing, "info")
+            self.is_paused = not self.is_paused
+            self._hold_deadline_while_paused()
+            self.events.emit("now_playing_update")
+            return True
+        else:
+            logging.warning("Tried to pause, but no file is playing!")
+            return False
+
+    def _hold_deadline_while_paused(self) -> None:
+        """Push the deadline back by however long the song sat paused."""
+        now = time.monotonic()
+        if self.is_paused:
+            self._paused_at = now
+        elif self._paused_at is not None:
+            if self._deadline is not None:
+                self._deadline += now - self._paused_at
+            self._paused_at = None
+
+    def get_now_playing(self) -> dict[str, str | int | float | bool | None]:
+        """Get the current playback state.
+
+        Returns:
+            Dictionary with now playing information.
+        """
+        return {
+            "now_playing": self.now_playing,
+            "playback_id": self.playback_id,
+            "now_playing_user": self.now_playing_user,
+            "now_playing_duration": self.now_playing_duration,
+            "now_playing_transpose": self.now_playing_transpose,
+            "now_playing_url": self.now_playing_url,
+            "now_playing_subtitle_url": self.now_playing_subtitle_url,
+            "now_playing_position": self.now_playing_position,
+            "is_paused": self.is_paused,
+        }
+
+    def reset_now_playing(self) -> None:
+        """Reset all now playing state to defaults."""
+        self.playback_id = None
+        self.now_playing = None
+        self.now_playing_filename = None
+        self.now_playing_user = None
+        self.now_playing_url = None
+        self.now_playing_subtitle_url = None
+        self.is_paused = True
+        self.is_playing = False
+        self.now_playing_transpose = 0
+        self.now_playing_duration = None
+        self.now_playing_position = None
+        self._deadline = None
+        self._paused_at = None
+
+    def log_output(self) -> None:
+        """Log any pending FFmpeg output."""
+        self.stream_manager.log_ffmpeg_output()

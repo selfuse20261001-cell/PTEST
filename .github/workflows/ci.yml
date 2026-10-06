@@ -1,0 +1,22 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+    - claude/ecstatic-fermi-8g51v8
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    name: Unit Tests
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v7
+
+    - name: Install uv
+      # setup-uv stopped publishing moving major tags at v8, so pin the exact version.
+      uses: astral-sh/setup-uv@v9.0.0
+
+    - name: Run tests
+      run: uv run pytest tests/ -q

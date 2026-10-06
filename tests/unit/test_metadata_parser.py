@@ -1,0 +1,1001 @@
+"""Unit tests for metadata_parser module."""
+
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from pikaraoke.lib.metadata_parser import (
+    clean_search_query,
+    clear_song_name_cache,
+    get_best_result,
+    get_song_correct_name,
+    has_artist_title_separator,
+    has_youtube_id,
+    is_discardable_qualifier,
+    lookup_lastfm,
+    regex_tidy,
+    sanitize_filename,
+    score_result,
+    search_lastfm_tracks,
+    youtube_id_suffix,
+)
+
+
+class TestSanitizeFilename:
+    def test_path_separators_go_on_posix_too(self, monkeypatch):
+        """A name of '../../x' on a Pi used to move the song out of the library."""
+        monkeypatch.setattr("pikaraoke.lib.metadata_parser.is_windows", lambda: False)
+        assert sanitize_filename("../../home/pi/x") == "..-..-home-pi-x"
+        assert sanitize_filename("a\\b") == "a-b"
+
+    def test_illegal_characters_get_the_stand_in_they_deserve(self, monkeypatch):
+        """A dash for everything reads as corruption: Bobby -Boris- Pickett for a
+        nickname, What Does the Fox Say- for a question."""
+        monkeypatch.setattr("pikaraoke.lib.metadata_parser.is_windows", lambda: True)
+        assert sanitize_filename('Bobby "Boris" Pickett') == "Bobby 'Boris' Pickett"
+        assert sanitize_filename("Ylvis - What Does the Fox Say?") == (
+            "Ylvis - What Does the Fox Say"
+        )
+        # A dash where it stands in for structure, not for punctuation
+        assert sanitize_filename("AC/DC - T.N.T.") == "AC-DC - T.N.T."
+        assert sanitize_filename("Cee Lo Green - F**k You") == "Cee Lo Green - F--k You"
+
+    def test_a_dropped_character_leaves_no_dangling_separator(self, monkeypatch):
+        """The substitution runs at the end as readily as the middle, and a name
+        ending in a stray dash looks truncated rather than sanitized."""
+        monkeypatch.setattr("pikaraoke.lib.metadata_parser.is_windows", lambda: True)
+        assert sanitize_filename("Blondie - Rip Her to Shreds*") == "Blondie - Rip Her to Shreds"
+        assert sanitize_filename("Prince - 1999?") == "Prince - 1999"
+
+    def test_a_name_is_never_sanitized_away_to_nothing(self, monkeypatch):
+        """The rename route checks for an empty name before sanitizing, so a name
+        emptied here would build a path of bare extension -- a hidden file."""
+        monkeypatch.setattr("pikaraoke.lib.metadata_parser.is_windows", lambda: True)
+        assert sanitize_filename("---") == "---"
+        assert sanitize_filename("?") == "-"
+        assert sanitize_filename("") == ""
+
+    def test_posix_legal_characters_survive(self, monkeypatch):
+        """Colons and question marks are legal on POSIX and appear in real titles."""
+        monkeypatch.setattr("pikaraoke.lib.metadata_parser.is_windows", lambda: False)
+        assert sanitize_filename("Who's Next: Part 2?") == "Who's Next: Part 2?"
+
+
+class TestIsDiscardableQualifier:
+    """Which bracketed text a rename may drop, and which names another recording."""
+
+    def test_production_noise_is_discardable(self):
+        for text in (
+            "Official Video",
+            "Official Music Video",
+            "Karaoke",
+            "Karaoke Version",
+            "HD",
+            "Lyrics",
+            "With Lyrics",
+            "Original Key",
+            "Without Backing Vocals",
+            "No Backing Vocals",
+            "カラオケ",
+            "2011",
+        ):
+            assert is_discardable_qualifier(text), text
+
+    def test_recording_variants_are_not_discardable(self):
+        """Dropping one of these renames a recording into a different one, which
+        can collide with the studio cut already filed beside it."""
+        for text in (
+            "Live",
+            "Acoustic",
+            "Lower Key",
+            "Higher Key",
+            "Remastered 2010",
+            "2011 Remaster",
+            "Unplugged",
+            "Single Edit",
+            "Club Mix",
+            "Mono Version",
+            "BBC Session",
+            "Alternate Take",
+            "Taylor's Version",
+            "With Backing Vocals",
+        ):
+            assert not is_discardable_qualifier(text), text
+
+    def test_an_attribution_is_discardable(self):
+        """regex_tidy moves the artist out to the other side of the separator,
+        so the bracket it came from is spent, not lost."""
+        for text in ("Made Famous by Julie London", "In the Style of ABBA", "by Adele"):
+            assert is_discardable_qualifier(text), text
+
+    def test_an_unknown_qualifier_fails_closed(self):
+        """The point of the whitelist: a release form nobody listed is kept."""
+        assert not is_discardable_qualifier("Rarities Box Set")
+
+
+@pytest.fixture(autouse=True)
+def _clear_cache():
+    """Ensure each test starts with an empty song name cache."""
+    clear_song_name_cache()
+    yield
+    clear_song_name_cache()
+
+
+class TestCleanSearchQuery:
+    """Tests for the clean_search_query function."""
+
+    def test_removes_karaoke_suffix(self):
+        result = clean_search_query("Artist - Song karaoke")
+        assert "karaoke" not in result.lower()
+
+    def test_removes_official_video(self):
+        result = clean_search_query("Artist - Song Official Music Video")
+        assert "official" not in result.lower()
+        assert "video" not in result.lower()
+
+    def test_removes_lyrics(self):
+        result = clean_search_query("Artist - Song with lyrics")
+        assert "lyrics" not in result.lower()
+
+    def test_removes_parentheses_content(self):
+        result = clean_search_query("Artist - Song (Official Video)")
+        assert "(" not in result
+        assert ")" not in result
+        assert "Official" not in result
+
+    def test_removes_brackets_content(self):
+        result = clean_search_query("Artist - Song [HD]")
+        assert "[" not in result
+        assert "]" not in result
+        assert "HD" not in result
+
+    def test_replaces_underscores_with_spaces(self):
+        result = clean_search_query("Artist_Name_-_Song_Title")
+        assert "_" not in result
+        assert "Artist Name" in result
+
+    def test_removes_instrumental(self):
+        result = clean_search_query("Artist - Song Instrumental")
+        assert "instrumental" not in result.lower()
+
+    def test_removes_hd_hq(self):
+        result = clean_search_query("Artist - Song HD HQ")
+        assert "hd" not in result.lower()
+        assert "hq" not in result.lower()
+
+    def test_removes_feat(self):
+        result = clean_search_query("Artist feat. Other - Song")
+        assert "feat" not in result.lower()
+
+    def test_removes_remaster(self):
+        result = clean_search_query("Artist - Song Remaster")
+        assert "remaster" not in result.lower()
+
+    def test_preserves_artist_and_title(self):
+        result = clean_search_query("Coldplay - Viva La Vida")
+        assert "Coldplay" in result
+        assert "Viva La Vida" in result
+
+    def test_removes_emojis(self):
+        result = clean_search_query("Artist - Song \U0001f3a4\U0001f3b5")
+        assert "\U0001f3a4" not in result
+        assert "\U0001f3b5" not in result
+
+    def test_emoji_removal_preserves_word_boundaries(self):
+        result = clean_search_query("I Will Survive\U0001f3a4HQ")
+        assert result == "I Will Survive"
+
+    def test_preserves_cjk_characters(self):
+        result = clean_search_query("\u5bb9\u6613\u53d7\u50b7\u7684\u5973\u4eba KARAOKE")
+        assert "\u5bb9\u6613\u53d7\u50b7\u7684\u5973\u4eba" in result
+
+    def test_preserves_japanese_characters(self):
+        result = clean_search_query("\u30ab\u30e9\u30aa\u30b1 \u30bd\u30f3\u30b0")
+        assert "\u30ab\u30e9\u30aa\u30b1" in result
+
+    def test_preserves_hangul(self):
+        result = clean_search_query("\uac00\ub098\ub2e4\ub77c - \ub178\ub798")
+        assert "\uac00\ub098\ub2e4\ub77c" in result
+
+    def test_strips_whitespace(self):
+        result = clean_search_query("  Artist - Song  ")
+        assert not result.startswith(" ")
+        assert not result.endswith(" ")
+
+    def test_complex_query_cleanup(self):
+        query = (
+            "Artist_Name - Song Title (Official Music Video) [HD] karaoke with lyrics \U0001f3a4"
+        )
+        result = clean_search_query(query)
+        assert "Artist Name" in result
+        assert "Song Title" in result
+        assert "karaoke" not in result.lower()
+        assert "lyrics" not in result.lower()
+        assert "[" not in result
+        assert "(" not in result
+
+
+class TestScoreResult:
+    """Tests for the score_result function."""
+
+    def test_exact_match_high_score(self):
+        result = {"name": "Viva La Vida", "artist": "Coldplay"}
+        score = score_result(result, "Coldplay - Viva La Vida")
+        assert score >= 100
+
+    def test_exact_match_reversed_order(self):
+        result = {"name": "Viva La Vida", "artist": "Coldplay"}
+        score = score_result(result, "Viva La Vida - Coldplay")
+        assert score >= 100
+
+    def test_partial_match_moderate_score(self):
+        result = {"name": "Viva La Vida", "artist": "Coldplay"}
+        score = score_result(result, "Coldplay - Viva")
+        assert 0 < score < 100
+
+    def test_uppercase_penalized(self):
+        result_upper = {"name": "VIVA LA VIDA", "artist": "COLDPLAY"}
+        result_normal = {"name": "Viva La Vida", "artist": "Coldplay"}
+        score_upper = score_result(result_upper, "Coldplay - Viva La Vida")
+        score_normal = score_result(result_normal, "Coldplay - Viva La Vida")
+        assert score_upper < score_normal
+
+    def test_no_match_low_score(self):
+        result = {"name": "Completely Different", "artist": "Unknown Artist"}
+        score = score_result(result, "Coldplay - Viva La Vida")
+        assert score <= 0
+
+    def test_empty_result_fields(self):
+        result = {"name": "", "artist": ""}
+        score = score_result(result, "Coldplay - Viva La Vida")
+        assert isinstance(score, int)
+
+    def test_missing_result_fields(self):
+        result = {}
+        score = score_result(result, "Coldplay - Viva La Vida")
+        assert isinstance(score, int)
+
+    def test_query_with_pipe_separator(self):
+        result = {"name": "Song Title", "artist": "Artist Name"}
+        score = score_result(result, "Artist Name | Song Title")
+        assert score >= 50
+
+    def test_accented_characters_matched(self):
+        result = {"name": "Caf\u00e9", "artist": "Artiste"}
+        score = score_result(result, "Artiste - Cafe")
+        assert score > 0
+
+    def test_single_part_query_exact_match(self):
+        result = {"name": "Bohemian Rhapsody", "artist": "Queen"}
+        score = score_result(result, "Bohemian Rhapsody")
+        assert isinstance(score, int)
+
+    def test_single_part_query_partial_match(self):
+        result = {"name": "Bohemian Rhapsody", "artist": "Queen"}
+        score = score_result(result, "Bohemian")
+        assert isinstance(score, int)
+
+    def test_word_matching_fallback(self):
+        result = {"name": "Something Different Song", "artist": "Artist"}
+        score = score_result(result, "Something - Artist")
+        assert score > -1000
+
+    def test_bad_keyword_penalization_live(self):
+        result_live = {"name": "Song - Live", "artist": "Artist"}
+        result_normal = {"name": "Song", "artist": "Artist"}
+        score_live = score_result(result_live, "Artist - Song")
+        score_normal = score_result(result_normal, "Artist - Song")
+        assert score_live < score_normal
+
+    def test_version_keyword_uses_word_boundaries(self):
+        """'Oliver's Army' should not be penalized for containing 'live'."""
+        result = {"name": "Oliver's Army", "artist": "Elvis Costello"}
+        score = score_result(result, "Elvis Costello - Oliver's Army")
+        result_live = {"name": "Oliver's Army - Live", "artist": "Elvis Costello"}
+        score_live = score_result(result_live, "Elvis Costello - Oliver's Army")
+        assert score > score_live
+
+    def test_bad_keyword_penalization_remix(self):
+        result = {"name": "Song remix", "artist": "Artist"}
+        score = score_result(result, "Artist - Song")
+        assert isinstance(score, int)
+
+    def test_long_title_penalization(self):
+        long_name = "A" * 65
+        result = {"name": long_name, "artist": "Artist"}
+        score = score_result(result, "Artist - Song")
+        assert isinstance(score, int)
+
+    def test_mbid_bonus(self):
+        result_with_mbid = {"name": "Song", "artist": "Artist", "mbid": "abc123"}
+        result_without_mbid = {"name": "Song", "artist": "Artist"}
+        score_with = score_result(result_with_mbid, "Artist - Song")
+        score_without = score_result(result_without_mbid, "Artist - Song")
+        assert score_with > score_without
+
+    def test_artist_in_track_name_penalization(self):
+        result = {"name": "Coldplay - Viva La Vida", "artist": "Coldplay"}
+        score = score_result(result, "Coldplay - Viva La Vida")
+        assert isinstance(score, int)
+
+    def test_no_artist_match_penalization(self):
+        result = {"name": "Song Title", "artist": "Unknown Artist"}
+        score = score_result(result, "Coldplay - Song Title")
+        assert score < 100
+
+    def test_part2_word_matching(self):
+        result = {"name": "Amazing Song Title", "artist": "SomeArtist"}
+        score = score_result(result, "Whatever - Amazing")
+        assert isinstance(score, int)
+
+
+class TestGetBestResult:
+    """Tests for the get_best_result function."""
+
+    def test_returns_none_for_empty_results(self):
+        assert get_best_result([], "Artist - Song") is None
+
+    def test_returns_none_for_none_results(self):
+        assert get_best_result(None, "Artist - Song") is None
+
+    def test_joins_artist_first(self):
+        """The query is title-first; the requested order wins anyway."""
+        results = [{"name": "Song Title", "artist": "Artist Name"}]
+        result = get_best_result(results, "Song Title - Artist Name", artist_first=True)
+        assert result == "Artist Name - Song Title"
+
+    def test_joins_title_first(self):
+        """And the same in reverse, so neither order is merely the default."""
+        results = [{"name": "Song Title", "artist": "Artist Name"}]
+        result = get_best_result(results, "Artist Name - Song Title", artist_first=False)
+        assert result == "Song Title - Artist Name"
+
+    def test_selects_best_match(self):
+        results = [
+            {"name": "Wrong Song", "artist": "Wrong Artist"},
+            {"name": "Viva La Vida", "artist": "Coldplay"},
+            {"name": "Another Wrong", "artist": "Another"},
+        ]
+        result = get_best_result(results, "Coldplay - Viva La Vida")
+        assert "Viva La Vida" in result
+        assert "Coldplay" in result
+
+    def test_multiple_results_sorted_by_score(self):
+        results = [
+            {"name": "Song", "artist": "Artist"},
+            {"name": "Song", "artist": "Artist", "mbid": "bonus"},
+        ]
+        result = get_best_result(results, "Artist - Song")
+        assert " - " in result
+
+
+class TestLookupLastfm:
+    """Tests for the lookup_lastfm function (pure Last.fm path)."""
+
+    @patch("requests.get")
+    def test_returns_none_on_api_error(self, mock_get):
+        mock_get.return_value.status_code = 500
+        result = lookup_lastfm("Artist - Song")
+        assert result is None
+
+    @patch("requests.get")
+    def test_returns_none_on_empty_results(self, mock_get):
+        mock_get.return_value.status_code = 200
+        mock_get.return_value.json.return_value = {"results": {"trackmatches": {"track": []}}}
+        result = lookup_lastfm("Unknown Song That Doesn't Exist")
+        assert result is None
+
+    @patch("requests.get")
+    def test_returns_best_match(self, mock_get):
+        mock_get.return_value.status_code = 200
+        mock_get.return_value.json.return_value = {
+            "results": {
+                "trackmatches": {
+                    "track": [
+                        {"name": "Viva La Vida", "artist": "Coldplay"},
+                    ]
+                }
+            }
+        }
+        result = lookup_lastfm("Coldplay - Viva La Vida")
+        assert result == "Coldplay - Viva La Vida"
+
+    @patch("requests.get")
+    def test_cleans_query_before_search(self, mock_get):
+        mock_get.return_value.status_code = 200
+        mock_get.return_value.json.return_value = {"results": {"trackmatches": {"track": []}}}
+        lookup_lastfm("Artist - Song (Official Video) karaoke")
+        call_args = mock_get.call_args
+        params = call_args[1]["params"]
+        assert "karaoke" not in params["track"].lower()
+        assert "official" not in params["track"].lower()
+
+    @patch("requests.get")
+    def test_the_filename_order_does_not_decide(self, mock_get):
+        mock_get.return_value.status_code = 200
+        mock_get.return_value.json.return_value = {
+            "results": {
+                "trackmatches": {
+                    "track": [
+                        {"name": "Song Title", "artist": "Artist Name"},
+                    ]
+                }
+            }
+        }
+        result = lookup_lastfm("Song Title - Artist Name (Official Video) karaoke")
+        assert result == "Artist Name - Song Title"
+
+    @patch("requests.get")
+    def test_the_order_is_part_of_the_cache_key(self, mock_get):
+        """Without it the second call would serve the first call's join."""
+        mock_get.return_value.status_code = 200
+        mock_get.return_value.json.return_value = {
+            "results": {
+                "trackmatches": {
+                    "track": [
+                        {"name": "Viva La Vida", "artist": "Coldplay"},
+                    ]
+                }
+            }
+        }
+        assert lookup_lastfm("Viva La Vida", artist_first=True) == "Coldplay - Viva La Vida"
+        assert lookup_lastfm("Viva La Vida", artist_first=False) == "Viva La Vida - Coldplay"
+
+    @patch("requests.get")
+    def test_returns_none_on_missing_trackmatches(self, mock_get):
+        mock_get.return_value.status_code = 200
+        mock_get.return_value.json.return_value = {"results": {}}
+        result = lookup_lastfm("Artist - Song")
+        assert result is None
+
+
+VALID_RESPONSE = {
+    "results": {"trackmatches": {"track": [{"name": "Viva La Vida", "artist": "Coldplay"}]}}
+}
+
+RATE_LIMIT_RESPONSE = {"error": 29, "message": "Rate limit exceeded"}
+
+
+class TestRateLimiting:
+    """Tests for Last.fm rate limiting, retry, and cache-skip behavior."""
+
+    @patch("pikaraoke.lib.metadata_parser.time.sleep")
+    @patch("requests.get")
+    def test_error_29_triggers_retry_and_succeeds(self, mock_get, mock_sleep):
+        rate_limit_resp = MagicMock(status_code=200)
+        rate_limit_resp.json.return_value = RATE_LIMIT_RESPONSE
+
+        ok_resp = MagicMock(status_code=200)
+        ok_resp.json.return_value = VALID_RESPONSE
+
+        mock_get.side_effect = [rate_limit_resp, ok_resp]
+        result = lookup_lastfm("Coldplay - Viva La Vida")
+        assert result is not None
+        assert "Viva La Vida" in result
+        assert mock_get.call_count == 2
+
+    @patch("pikaraoke.lib.metadata_parser.time.sleep")
+    @patch("requests.get")
+    def test_http_429_triggers_retry_and_succeeds(self, mock_get, mock_sleep):
+        http_429_resp = MagicMock(status_code=429)
+
+        ok_resp = MagicMock(status_code=200)
+        ok_resp.json.return_value = VALID_RESPONSE
+
+        mock_get.side_effect = [http_429_resp, ok_resp]
+        result = lookup_lastfm("Coldplay - Viva La Vida")
+        assert result is not None
+        assert "Viva La Vida" in result
+
+    @patch("pikaraoke.lib.metadata_parser.time.sleep")
+    @patch("requests.get")
+    def test_rate_limited_result_not_cached(self, mock_get, mock_sleep):
+        rate_limit_resp = MagicMock(status_code=200)
+        rate_limit_resp.json.return_value = RATE_LIMIT_RESPONSE
+
+        mock_get.side_effect = [rate_limit_resp, rate_limit_resp, rate_limit_resp]
+        result = lookup_lastfm("Coldplay - Viva La Vida")
+        assert result is None
+
+        ok_resp = MagicMock(status_code=200)
+        ok_resp.json.return_value = VALID_RESPONSE
+        mock_get.side_effect = [ok_resp]
+        result = lookup_lastfm("Coldplay - Viva La Vida")
+        assert result is not None
+        assert "Viva La Vida" in result
+
+    @patch("pikaraoke.lib.metadata_parser.time.sleep")
+    @patch("requests.get")
+    def test_genuine_no_results_is_cached(self, mock_get, mock_sleep):
+        ok_resp = MagicMock(status_code=200)
+        ok_resp.json.return_value = {"results": {"trackmatches": {"track": []}}}
+        mock_get.return_value = ok_resp
+
+        result1 = lookup_lastfm("Completely Unknown Song XYZ")
+        result2 = lookup_lastfm("Completely Unknown Song XYZ")
+        assert result1 is None
+        assert result2 is None
+        assert mock_get.call_count == 1
+
+    @patch("pikaraoke.lib.metadata_parser.time.sleep")
+    @patch("requests.get")
+    def test_max_retries_exhausted(self, mock_get, mock_sleep):
+        rate_limit_resp = MagicMock(status_code=200)
+        rate_limit_resp.json.return_value = RATE_LIMIT_RESPONSE
+        mock_get.return_value = rate_limit_resp
+
+        result = lookup_lastfm("Coldplay - Viva La Vida")
+        assert result is None
+        assert mock_get.call_count == 3
+
+    @patch("requests.get")
+    @patch("pikaraoke.lib.metadata_parser.time.sleep")
+    def test_backoff_timing(self, mock_sleep, mock_get):
+        rate_limit_resp = MagicMock(status_code=200)
+        rate_limit_resp.json.return_value = RATE_LIMIT_RESPONSE
+        mock_get.return_value = rate_limit_resp
+
+        lookup_lastfm("Coldplay - Viva La Vida")
+
+        backoff_calls = [
+            call.args[0] for call in mock_sleep.call_args_list if call.args and call.args[0] >= 1.0
+        ]
+        assert backoff_calls == [1.0, 2.0]
+
+
+class TestRegexTidy:
+    """Tests for the regex_tidy function."""
+
+    def test_strips_trailing_karaoke(self):
+        assert regex_tidy("Artist - Song karaoke") == "Artist - Song"
+
+    def test_strips_trailing_hd(self):
+        assert regex_tidy("Artist - Song HD") == "Artist - Song"
+
+    def test_strips_trailing_instrumental(self):
+        assert regex_tidy("Artist - Song instrumental") == "Artist - Song"
+
+    def test_strips_trailing_lyrics(self):
+        assert regex_tidy("Artist - Song lyrics") == "Artist - Song"
+
+    def test_strips_trailing_with_lyrics(self):
+        assert regex_tidy("Artist - Song with lyrics") == "Artist - Song"
+
+    def test_strips_trailing_lyrics_on_screen(self):
+        assert regex_tidy("Artist - Song with Lyrics on Screen") == "Artist - Song"
+
+    def test_strips_backing_vocals_bracket_before_karaoke(self):
+        title = "Artist - Song (Without Backing Vocals) (Karaoke Version) with Lyrics On Screen"
+        assert regex_tidy(title) == "Artist - Song"
+
+    def test_backing_vocals_strip_keeps_a_real_variant(self):
+        title = "Artist - Song (2025 Remake) (No Backing Vocals) (Karaoke Version)"
+        assert regex_tidy(title) == "Artist - Song (2025 Remake)"
+
+    def test_with_backing_vocals_is_kept_like_any_variant(self):
+        title = "Artist - Song (With Backing Vocals) (Karaoke Version)"
+        assert regex_tidy(title) == "Artist - Song (With Backing Vocals)"
+
+    def test_discardable_qualifier_before_keyword_is_dropped(self):
+        assert regex_tidy("Artist - Song (Official Video) (Karaoke Version)") == "Artist - Song"
+
+    def test_exposed_qualifier_is_dropped_on_attribution_path(self):
+        title = "Song (Official Video) (Karaoke Version) (Made Famous by Adele)"
+        assert regex_tidy(title) == "Song - Adele"
+
+    def test_attribution_path_keeps_a_real_variant(self):
+        title = "Song (Live) (Karaoke Version) (Made Famous by Adele)"
+        assert regex_tidy(title) == "Song (Live) - Adele"
+
+    def test_interior_karaoke_bracket_keeps_the_trailing_artist(self):
+        assert (
+            regex_tidy("Black Valentine (Karaoke) - Caro Emerald")
+            == "Black Valentine - Caro Emerald"
+        )
+
+    def test_interior_strip_keeps_a_real_variant_before_the_artist(self):
+        title = "Impossible (Factor X) (Karaoke) - James Arthur"
+        assert regex_tidy(title) == "Impossible (Factor X) - James Arthur"
+
+    def test_interior_strip_leaves_a_plain_trailing_qualifier_alone(self):
+        title = "Travis Scott - RHYNO (from GTAVI: The Album) (Karaoke Version)"
+        assert regex_tidy(title) == "Travis Scott - RHYNO (from GTAVI: The Album)"
+
+    def test_strips_trailing_parenthesised_content(self):
+        assert regex_tidy("Artist - Song (Official Video)") == "Artist - Song"
+
+    def test_strips_trailing_bracketed_content(self):
+        assert regex_tidy("Artist - Song [HD]") == "Artist - Song"
+
+    def test_replaces_underscores(self):
+        result = regex_tidy("Artist_Name - Song_Title")
+        assert "_" not in result
+        assert "Artist Name - Song Title" == result
+
+    def test_removes_emoji(self):
+        result = regex_tidy("Artist - Song \U0001f3a4")
+        assert "\U0001f3a4" not in result
+
+    def test_emoji_removal_preserves_word_boundaries(self):
+        result = regex_tidy("CAKE _ I Will Survive\U0001f3a4HQ Karaoke\U0001f3a4")
+        assert result == "CAKE I Will Survive"
+
+    def test_normalizes_em_dash(self):
+        assert regex_tidy("Artist \u2014 Song") == "Artist - Song"
+
+    def test_normalizes_en_dash(self):
+        assert regex_tidy("Artist \u2013 Song") == "Artist - Song"
+
+    def test_strips_trailing_dash(self):
+        assert regex_tidy("Artist - Song -") == "Artist - Song"
+
+    def test_collapses_whitespace(self):
+        result = regex_tidy("Artist  -  Song   Title")
+        assert "  " not in result
+
+    def test_attribution_made_famous_by(self):
+        result = regex_tidy("My Heart Will Go On (Made Famous by Celine Dion)")
+        assert result == "My Heart Will Go On - Celine Dion"
+
+    def test_attribution_in_the_style_of(self):
+        result = regex_tidy("Bohemian Rhapsody (In the Style of Queen)")
+        assert result == "Bohemian Rhapsody - Queen"
+
+    def test_attribution_originally_performed_by(self):
+        result = regex_tidy("Yesterday (Originally Performed by The Beatles)")
+        assert result == "Yesterday - The Beatles"
+
+    def test_attribution_inline_trailing(self):
+        result = regex_tidy("Sweet Caroline made famous by Neil Diamond")
+        assert result == "Sweet Caroline - Neil Diamond"
+
+    def test_strips_karaoke_version_from_source(self):
+        assert (
+            regex_tidy("ABBA - Fernando - Karaoke Version from Zoom Karaoke") == "ABBA - Fernando"
+        )
+
+    def test_strips_karaoke_from_source(self):
+        assert regex_tidy("Artist - Song Karaoke from KaraFun") == "Artist - Song"
+
+    def test_strips_karaoke_dash_source(self):
+        assert regex_tidy("Artist - Song - Karaoke - Sing King") == "Artist - Song"
+
+    def test_strips_karaoke_by_source(self):
+        assert regex_tidy("Artist - Song - Karaoke by Stingray") == "Artist - Song"
+
+    def test_a_closed_karaoke_bracket_makes_by_an_attribution(self):
+        """The bracket is the whole difference: "Karaoke by Stingray" names the
+        vendor who cut the track, "[Karaoke] by Stingray" names the artist."""
+        assert regex_tidy("Song [Karaoke Version] by Julie London") == "Song - Julie London"
+        assert regex_tidy("Song (Karaoke) by Julie London") == "Song - Julie London"
+        assert regex_tidy("Song [Karaoke by Stingray]") == "Song"
+
+    def test_no_dangling_separator_after_noise_and_attribution_removal(self):
+        result = regex_tidy("Fernando - KARAOKE VERSION - as popularized by ABBA")
+        assert result == "Fernando - ABBA"
+
+    def test_preserves_cjk_title(self):
+        result = regex_tidy(
+            "\u5bb9\u6613\u53d7\u50b7\u7684\u5973\u4eba-\u738b\u9756\u96ef-\u4f34\u594f KARAOKE"
+        )
+        assert "\u5bb9\u6613\u53d7\u50b7\u7684\u5973\u4eba" in result
+        assert "\u738b\u9756\u96ef" in result
+
+    def test_no_dangling_open_paren_after_noise_removal(self):
+        result = regex_tidy(
+            "Paul Kelly - Firewood and Candles (Karaoke Version) with Lyrics HD Vocal-Star Karaoke"
+        )
+        assert result == "Paul Kelly - Firewood and Candles"
+
+    def test_a_leading_round_bracket_of_noise_is_stripped_not_swept(self):
+        """The sweep deletes from a karaoke keyword to the end, so a vendor who
+        opens with the tag rather than closing with it lost the whole song."""
+        assert (
+            regex_tidy("(USA Karaoke) The Sound Of Silence - Simon & Garfunkel")
+            == "The Sound Of Silence - Simon & Garfunkel"
+        )
+
+    def test_a_name_opening_on_a_keyword_survives(self):
+        """Nothing precedes it, so the sweep would take everything. An unreadable
+        name still gives the search a query and the score something to measure."""
+        name = "Karaoke Cover of Sound of Silence - Todd Hoffman Cover"
+        assert regex_tidy(name) == name
+
+    def test_an_unclosed_bracket_takes_its_tail_with_it(self):
+        """The sweep starts inside the bracket, so what it leaves is an opening
+        bracket and the words before the keyword: "(Piano", not "(" alone."""
+        assert (
+            regex_tidy("Simon&Garfunkel - Sound Of Silence (Piano Karaoke) Higher Key")
+            == "Simon&Garfunkel - Sound Of Silence"
+        )
+
+    def test_preserves_feat_parenthetical(self):
+        assert regex_tidy("Artist - Song (feat. Other)") == "Artist - Song (feat. Other)"
+
+    def test_preserves_ft_parenthetical(self):
+        assert regex_tidy("Artist - Song (ft. Other Artist)") == "Artist - Song (ft. Other Artist)"
+
+    def test_strips_feat_bracketed(self):
+        assert regex_tidy("Artist - Song [feat. Other]") == "Artist - Song"
+
+    def test_strips_leading_karaoke_label(self):
+        result = regex_tidy("KARAOKE - Cry Me a River by Julie London")
+        assert result == "Cry Me a River by Julie London"
+
+    def test_strips_leading_instrumental_label(self):
+        assert regex_tidy("Instrumental - Artist - Song") == "Artist - Song"
+
+    def test_strips_leading_official_video_with_pipe(self):
+        assert regex_tidy("Official Video | Artist - Song") == "Artist - Song"
+
+    def test_strips_leading_official_music_video(self):
+        assert regex_tidy("Official Music Video - Artist - Song") == "Artist - Song"
+
+    def test_no_change_when_clean(self):
+        assert regex_tidy("Artist - Song Title") == "Artist - Song Title"
+
+    # -- CJK dash normalization (Kana / Hangul) --------------------------------
+
+    def test_cjk_dash_normalizes_katakana(self):
+        assert regex_tidy("アーティスト-曲名") == "アーティスト - 曲名"
+
+    def test_cjk_dash_normalizes_hangul(self):
+        assert regex_tidy("가수-노래제목") == "가수 - 노래제목"
+
+    def test_cjk_dash_normalizes_hiragana(self):
+        assert regex_tidy("あいみょん-マリーゴールド") == "あいみょん - マリーゴールド"
+
+    # -- Japanese corner brackets ----------------------------------------------
+
+    def test_strips_corner_bracket_label(self):
+        assert regex_tidy("Song Title「カラオケ」") == "Song Title"
+
+    def test_strips_corner_bracket_with_content(self):
+        assert regex_tidy("曲名「歌ってみた」- Artist") == "曲名 - Artist"
+
+    def test_unwraps_white_corner_bracket_title(self):
+        assert regex_tidy("Singer -『Song Title』") == "Singer - Song Title"
+
+    def test_strips_white_corner_bracket_noise(self):
+        assert regex_tidy("Song Title『カラオケ』") == "Song Title"
+
+    def test_strips_white_corner_bracket_ktv(self):
+        assert regex_tidy("Song Title『KTV』") == "Song Title"
+
+    # -- Japanese trailing noise -----------------------------------------------
+
+    def test_strips_trailing_uttemita(self):
+        assert regex_tidy("Artist - Song 歌ってみた") == "Artist - Song"
+
+    def test_strips_trailing_off_vocal_ja(self):
+        assert regex_tidy("Artist - Song オフボーカル") == "Artist - Song"
+
+    def test_strips_trailing_vocaloid(self):
+        assert regex_tidy("Artist - Song ボカロ") == "Artist - Song"
+
+    def test_strips_trailing_cover_ja(self):
+        assert regex_tidy("Artist - Song カバー") == "Artist - Song"
+
+    # -- Korean trailing noise -------------------------------------------------
+
+    def test_strips_trailing_noraebang(self):
+        assert regex_tidy("Artist - Song 노래방") == "Artist - Song"
+
+    def test_strips_trailing_keumyoung(self):
+        assert regex_tidy("Artist - Song 금영") == "Artist - Song"
+
+    def test_strips_trailing_taejin(self):
+        assert regex_tidy("Artist - Song 태진") == "Artist - Song"
+
+    def test_strips_trailing_tj(self):
+        assert regex_tidy("Artist - Song TJ") == "Artist - Song"
+
+    def test_strips_trailing_mr(self):
+        assert regex_tidy("Artist - Song MR") == "Artist - Song"
+
+    # -- Korean leading noise --------------------------------------------------
+
+    def test_strips_leading_noraebang(self):
+        assert regex_tidy("노래방 - Song Title") == "Song Title"
+
+    def test_strips_leading_bracket_tj_noraebang(self):
+        assert regex_tidy("[TJ노래방] APT. - Artist") == "APT. - Artist"
+
+    def test_strips_leading_bracket_karaoke(self):
+        assert regex_tidy("[Karaoke] Artist - Song") == "Artist - Song"
+
+    # -- Bracket noise detection with Korean -----------------------------------
+
+    def test_strips_angle_bracket_noraebang(self):
+        assert regex_tidy("Song Title《노래방》") == "Song Title"
+
+    def test_strips_white_corner_bracket_noraebang(self):
+        assert regex_tidy("Song Title『노래방』") == "Song Title"
+
+    # -- Realistic CJK integration tests ---------------------------------------
+
+    def test_japanese_karaoke_filename(self):
+        assert regex_tidy("YOASOBI-夜に駆ける「カラオケ」歌ってみた") == "YOASOBI - 夜に駆ける"
+
+    def test_korean_karaoke_filename(self):
+        assert regex_tidy("BTS - Dynamite 노래방 MR") == "BTS - Dynamite"
+
+    def test_korean_tj_noraebang_full(self):
+        result = regex_tidy("[TJ노래방] APT. - 로제(ROSE),Bruno Mars _ TJ Karaoke")
+        assert result == "APT. - 로제(ROSE),Bruno Mars"
+
+    def test_chinese_title_in_white_corner_brackets(self):
+        assert regex_tidy("周杰倫 -『稻香』") == "周杰倫 - 稻香"
+
+
+class TestYoutubeIdSuffix:
+    """Tests for the youtube_id_suffix function."""
+
+    def test_pikaraoke_format(self):
+        assert youtube_id_suffix("/songs/Artist - Song---dQw4w9WgXcQ.mp4") == "---dQw4w9WgXcQ"
+
+    def test_ytdlp_bracket_format(self):
+        assert youtube_id_suffix("/songs/Artist - Song [dQw4w9WgXcQ].mp4") == " [dQw4w9WgXcQ]"
+
+    def test_no_youtube_id(self):
+        assert youtube_id_suffix("/songs/My Song.mp4") == ""
+
+    def test_short_bracket_not_matched(self):
+        assert youtube_id_suffix("/songs/Song [short].mp4") == ""
+
+
+class TestHasYoutubeId:
+    """Tests for the has_youtube_id function."""
+
+    def test_pikaraoke_format(self):
+        assert has_youtube_id("Artist - Song---dQw4w9WgXcQ.mp4") is True
+
+    def test_ytdlp_format(self):
+        assert has_youtube_id("Artist - Song [dQw4w9WgXcQ].mp4") is True
+
+    def test_no_id(self):
+        assert has_youtube_id("Artist - Song.mp4") is False
+
+    def test_short_id(self):
+        assert has_youtube_id("Artist - Song---short.mp4") is False
+
+    def test_full_path_pikaraoke(self):
+        assert has_youtube_id("/songs/Artist - Song---dQw4w9WgXcQ.mp4") is True
+
+    def test_full_path_ytdlp(self):
+        assert has_youtube_id("/songs/Artist - Song [dQw4w9WgXcQ].mp4") is True
+
+
+class TestHasArtistTitleSeparator:
+    """Tests for the has_artist_title_separator function."""
+
+    def test_with_separator(self):
+        assert has_artist_title_separator("Artist - Title") is True
+
+    def test_without_separator(self):
+        assert has_artist_title_separator("Just Title") is False
+
+    def test_dash_without_spaces(self):
+        assert has_artist_title_separator("Artist-Title") is False
+
+
+class TestSearchLastfmTracks:
+    """Tests for the search_lastfm_tracks function."""
+
+    @patch("requests.get")
+    def test_returns_formatted_results(self, mock_get):
+        mock_get.return_value.status_code = 200
+        mock_get.return_value.json.return_value = {
+            "results": {
+                "trackmatches": {
+                    "track": [
+                        {"name": "Song", "artist": "Artist", "extra": "ignored"},
+                    ]
+                }
+            }
+        }
+        results = search_lastfm_tracks("Artist - Song")
+        assert results == [{"name": "Song", "artist": "Artist"}]
+
+    @patch("pikaraoke.lib.metadata_parser.time.sleep")
+    @patch("requests.get")
+    def test_returns_empty_on_rate_limit(self, mock_get, mock_sleep):
+        rate_limit_resp = MagicMock(status_code=200)
+        rate_limit_resp.json.return_value = RATE_LIMIT_RESPONSE
+        mock_get.return_value = rate_limit_resp
+
+        results = search_lastfm_tracks("Artist - Song")
+        assert results == []
+
+    @patch("requests.get")
+    def test_passes_limit_param(self, mock_get):
+        mock_get.return_value.status_code = 200
+        mock_get.return_value.json.return_value = {"results": {"trackmatches": {"track": []}}}
+        search_lastfm_tracks("Artist - Song", limit=3)
+        params = mock_get.call_args[1]["params"]
+        assert params["limit"] == "3"
+
+
+class TestGetSongCorrectName:
+    """Every song is looked up; provenance decides only the fallback."""
+
+    @patch("pikaraoke.lib.metadata_parser.lookup_lastfm")
+    def test_a_youtube_file_with_a_separator_is_still_looked_up(self, mock_lookup):
+        """The filename's own order is not evidence of which half is the artist."""
+        mock_lookup.return_value = "Artist - Song Title"
+        result = get_song_correct_name(
+            "Song Title - Artist", raw_filename="/songs/Song Title - Artist---dQw4w9WgXcQ.mp4"
+        )
+        mock_lookup.assert_called_once_with("Song Title - Artist", artist_first=True)
+        assert result == "Artist - Song Title"
+
+    @patch("pikaraoke.lib.metadata_parser.lookup_lastfm")
+    def test_a_failed_lookup_falls_back_to_the_tidied_name(self, mock_lookup):
+        """A lookup that finds nothing costs the ordering, not the suggestion."""
+        mock_lookup.return_value = None
+        result = get_song_correct_name(
+            "Artist - Song Title (Karaoke Version)",
+            raw_filename="/songs/Artist - Song Title---dQw4w9WgXcQ.mp4",
+        )
+        assert result == "Artist - Song Title"
+
+    @patch("pikaraoke.lib.metadata_parser.lookup_lastfm")
+    def test_youtube_file_without_separator_falls_through(self, mock_lookup):
+        mock_lookup.return_value = "Sweet Caroline - Neil Diamond"
+        result = get_song_correct_name(
+            "Sweet Caroline", raw_filename="/songs/Sweet Caroline---dQw4w9WgXcQ.mp4"
+        )
+        mock_lookup.assert_called_once_with("Sweet Caroline", artist_first=True)
+        assert result == "Sweet Caroline - Neil Diamond"
+
+    @patch("pikaraoke.lib.metadata_parser.lookup_lastfm")
+    def test_a_non_youtube_file_has_no_tidy_fallback(self, mock_lookup):
+        """Only YouTube filenames carry the noise regex_tidy exists to strip."""
+        mock_lookup.return_value = None
+        result = get_song_correct_name("Artist - Song", raw_filename="/songs/Artist - Song.mp4")
+        assert result is None
+
+    @patch("pikaraoke.lib.metadata_parser.lookup_lastfm")
+    def test_non_youtube_file_always_uses_lastfm(self, mock_lookup):
+        mock_lookup.return_value = "Artist - Song"
+        result = get_song_correct_name("Artist - Song", raw_filename="/songs/Artist - Song.mp4")
+        mock_lookup.assert_called_once_with("Artist - Song", artist_first=True)
+        assert result == "Artist - Song"
+
+    @patch("pikaraoke.lib.metadata_parser.lookup_lastfm")
+    def test_no_raw_filename_uses_lastfm(self, mock_lookup):
+        mock_lookup.return_value = "Artist - Song"
+        result = get_song_correct_name("Artist - Song")
+        mock_lookup.assert_called_once_with("Artist - Song", artist_first=True)
+
+    @patch("pikaraoke.lib.metadata_parser.lookup_lastfm")
+    def test_youtube_bracket_format_falls_back_too(self, mock_lookup):
+        mock_lookup.return_value = None
+        result = get_song_correct_name(
+            "Artist - Song", raw_filename="/songs/Artist - Song [dQw4w9WgXcQ].mp4"
+        )
+        assert result == "Artist - Song"
+
+    # -- Taiwan KTV uploads ------------------------------------------------------
+
+    def test_lenticular_title_after_artist_is_kept(self):
+        assert regex_tidy("周杰倫 Jay Chou【告白氣球】KTV 伴唱版") == "周杰倫 Jay Chou - 告白氣球"
+
+    def test_lenticular_title_keeps_english_subtitle(self):
+        result = regex_tidy("五月天【派對動物 Party Animal】官方MV")
+        assert result == "五月天 - 派對動物 Party Animal"
+
+    def test_lenticular_karaoke_label_is_stripped(self):
+        assert regex_tidy("【KTV】鄧紫棋 - 光年之外 (伴唱版)") == "鄧紫棋 - 光年之外"
+
+    def test_lenticular_production_label_is_stripped(self):
+        assert regex_tidy("周杰倫【官方MV】晴天") == "周杰倫 晴天"
+
+    def test_lenticular_latin_label_is_stripped(self):
+        assert regex_tidy("Artist【MV】Song") == "Artist Song"
+
+    def test_lenticular_title_after_dash_gets_no_second_dash(self):
+        assert regex_tidy("周杰倫 - 【晴天】KTV") == "周杰倫 - 晴天"
+
+    def test_strips_trailing_banchang(self):
+        assert regex_tidy("伍佰 & China Blue - 突然的自我 伴唱") == "伍佰 & China Blue - 突然的自我"

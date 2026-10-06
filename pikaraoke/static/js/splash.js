@@ -1,0 +1,805 @@
+const withBasePath = (path) => `${window.pikaraokeConfig.basePath}${path}`;
+let socket = io({ path: window.pikaraokeConfig.socketioPath });
+let mouseTimer = null;
+let cursorVisible = false;
+let nowPlaying = {};
+let octopusInstance = null;
+let showMenu = false;
+let menuButtonVisible = false;
+let autoplayConfirmed = false;
+let volume = 0.85;
+const playbackStartTimeout = 10000;
+const bgMediaResumeDelay = 2000;
+const bgVideoChoices = PikaraokeConfig.bgVideoChoices;
+let currentVideoUrl = null;
+let hlsInstance = null;
+let idleTime = 0;
+let screensaverTimeoutSeconds = PikaraokeConfig.screensaverTimeout;
+let bg_playlist = [];
+let bgMediaResumeTimeout = null;
+let scoreReviews = {
+  low: ["Better luck next time!"],
+  mid: ["Not bad!"],
+  high: ["Great job!"],
+};
+let isMaster = false;
+let uiScale = null;
+let clockIntervalId = null;
+// Identifies the playback this screen is showing. Reported back to the server so
+// events about a song that has already ended can't be applied to its successor.
+let currentPlaybackId = null;
+
+// Browser detection
+const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
+const isMobileSafari = isSafari && (/iPhone|iPad|iPod/i.test(navigator.userAgent) || navigator.maxTouchPoints > 1);
+const isChrome = /chrome/i.test(navigator.userAgent) && !/edg/i.test(navigator.userAgent);
+const isFirefox = /firefox/i.test(navigator.userAgent);
+const isEdge = /edg/i.test(navigator.userAgent);
+const isSupportedBrowser = isSafari || isChrome || isFirefox || isEdge;
+
+const isMediaPlaying = (media) =>
+  !!(
+    media.currentTime > 0 &&
+    !media.paused &&
+    !media.ended &&
+    media.readyState > 2
+  );
+
+const formatTime = (seconds) => {
+  if (isNaN(seconds)) {
+    return "00:00";
+  }
+  const totalSeconds = Math.floor(seconds);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const secs = totalSeconds % 60;
+  const formattedMinutes = String(minutes).padStart(2, "0");
+  const formattedSeconds = String(secs).padStart(2, "0");
+  return `${formattedMinutes}:${formattedSeconds}`;
+}
+
+const releaseProbeVideo = (probe) => {
+  probe.pause();
+  probe.removeAttribute('src');
+  probe.load();
+};
+
+const testAutoplayCapability = async () => {
+  // Test if autoplay with audio is allowed using a real video file
+  const testVideo = document.createElement('video');
+  try {
+    testVideo.playsInline = true;
+    testVideo.muted = true;  // Start muted (always allowed)
+    testVideo.src = withBasePath("/static/video/test_autoplay.mp4");
+
+    // Wait for video to be ready
+    await new Promise((resolve, reject) => {
+      testVideo.onloadeddata = resolve;
+      testVideo.onerror = reject;
+    });
+
+    await testVideo.play();
+    // Now try to unmute - this is the real test
+    testVideo.muted = false;
+    testVideo.volume = 0.01;
+
+    // Brief delay to let browser enforce policy
+    await new Promise(resolve => setTimeout(resolve, 500));
+
+    // Check if browser paused or muted the video
+    const autoplayBlocked = testVideo.muted || testVideo.paused;
+    // Release before handleConfirmation starts the background media: pausing
+    // leaves the decoded stream held, and a device with a media pipeline limit
+    // counts this probe against it for the rest of the session.
+    releaseProbeVideo(testVideo);
+    if (autoplayBlocked) {
+      $('#permissions-modal').addClass('is-active');
+    } else {
+      handleConfirmation();
+    }
+  } catch (e) {
+    // Autoplay blocked
+    console.log("Autoplay error thrown", e);
+    releaseProbeVideo(testVideo);
+    $('#permissions-modal').addClass('is-active');
+  }
+};
+
+const handleConfirmation = () => {
+  $('#permissions-modal').removeClass('is-active');
+  autoplayConfirmed = true;
+  updateBackgroundMediaState(true);
+  loadNowPlaying();
+};
+
+const hideVideo = () => {
+  $("#video-container").hide();
+}
+
+const stopVideoPlayback = () => {
+  currentVideoUrl = null;
+  currentPlaybackId = null;
+  if (hlsInstance) {
+    hlsInstance.destroy();
+    hlsInstance = null;
+  }
+  const video = getVideoPlayer();
+  video.pause();
+  $("#video-source").attr("src", "");
+  video.load();
+  hideVideo();
+}
+
+const endSong = async (reason = null, showScore = false) => {
+  // Claim the playback up front: the score screen below can run for seconds, and
+  // the server must be told which song ended, not which one is current by then.
+  const endedPlaybackId = currentPlaybackId;
+  currentPlaybackId = null;
+  if (showScore && !PikaraokeConfig.disableScore) {
+    await startScore(withBasePath("/static/"));
+  }
+  // A song that started during the score screen has loaded itself into the
+  // player already; tearing down now would leave the screen black.
+  if (currentPlaybackId === null) stopVideoPlayback();
+  if (isMaster) {
+    socket.emit("end_song", reason, endedPlaybackId);
+  } else {
+    console.log("Slave active (read-only): skipping end_song emission");
+  }
+}
+
+const getBackgroundMusicPlayer = () => document.getElementById('background-music');
+const getBackgroundVideoPlayer = () => document.getElementById('bg-video');
+// No withBasePath: the server built these with url_for, which already carries
+// the base path.
+const getRandomBgVideo = () =>
+  bgVideoChoices[Math.floor(Math.random() * bgVideoChoices.length)];
+const getVideoPlayer = () => $("#video")[0]
+
+const getNextBgMusicSong = () => {
+  let currentSong = getBackgroundMusicPlayer().getAttribute('src');
+  let nextSong = bg_playlist[0];
+  if (currentSong) {
+    let currentIndex = bg_playlist.indexOf(currentSong);
+    if (currentIndex >= 0 && currentIndex < bg_playlist.length - 1) {
+      nextSong = bg_playlist[currentIndex + 1];
+    }
+  }
+  return nextSong;
+}
+
+const playBGMusic = async (play) => {
+  const audio = getBackgroundMusicPlayer();
+  // The fade-out defers pause() into its completion callback, and isMediaPlaying
+  // reads true until it lands, so without this a toggle inside the fade window
+  // is skipped as redundant and the stale pause inverts the element.
+  $(audio).stop(true);
+  if (play) {
+    if (PikaraokeConfig.disableBgMusic) return;
+    if (!autoplayConfirmed) return;
+    if (bg_playlist.length === 0) return;
+
+    if (!audio.getAttribute('src')) audio.setAttribute('src', getNextBgMusicSong());
+
+    if (!isMediaPlaying(audio)) {
+      audio.volume = 0;
+      if (audio.readyState <= 2) await audio.load();
+      await audio.play().catch(e => console.log("Autoplay blocked (music)"));
+    }
+    $(audio).animate({ volume: PikaraokeConfig.bgMusicVolume }, 2000);
+  } else {
+    if (audio) {
+      $(audio).animate({ volume: 0 }, 2000, () => audio.pause());
+    }
+  }
+}
+
+const playBGVideo = async (play) => {
+  const bgVideo = getBackgroundVideoPlayer();
+  const bgVideoContainer = $('#bg-video-container');
+
+  if (play) {
+    if (PikaraokeConfig.disableBgVideo) return;
+    if (!autoplayConfirmed) return;
+    if (bgVideoChoices.length === 0) return;
+
+    if (isMediaPlaying(bgVideo)) return;
+    // A fresh video per idle spell, looping until the next song starts. Some
+    // backgrounds run ten seconds and are cut to loop, so swapping them out
+    // while the splash is up reads as a fault.
+    bgVideo.setAttribute("src", getRandomBgVideo());
+    if (bgVideo.readyState <= 2) await bgVideo.load();
+    bgVideo.play().catch(() => console.log("Autoplay blocked (video)"));
+    bgVideoContainer.fadeIn(2000);
+  } else {
+    if (bgVideo && isMediaPlaying(bgVideo)) {
+      bgVideo.pause();
+      bgVideoContainer.fadeOut(2000);
+    }
+  }
+}
+
+const shouldBackgroundMediaPlay = () => {
+  return autoplayConfirmed &&
+    !nowPlaying.now_playing &&
+    !nowPlaying.up_next;
+};
+
+// Asserts both media's desired state rather than acting on the one that moved,
+// so turning either off leaves the other playing. playBGMusic(true) means "do
+// not start" when the preference is off, so the caller resolves it here.
+const applyBackgroundMediaState = () => {
+  const shouldPlay = shouldBackgroundMediaPlay();
+  playBGMusic(shouldPlay && !PikaraokeConfig.disableBgMusic);
+  playBGVideo(shouldPlay && bgVideoChoices.length > 0 && !PikaraokeConfig.disableBgVideo);
+};
+
+const updateBackgroundMediaState = (immediate = false) => {
+  // Clear any pending resume
+  if (bgMediaResumeTimeout) {
+    clearTimeout(bgMediaResumeTimeout);
+    bgMediaResumeTimeout = null;
+  }
+
+  if (immediate || !shouldBackgroundMediaPlay()) {
+    applyBackgroundMediaState();
+    return;
+  }
+  bgMediaResumeTimeout = setTimeout(() => {
+    bgMediaResumeTimeout = null;
+    applyBackgroundMediaState();
+  }, bgMediaResumeDelay);
+};
+
+const flashNotification = (message, categoryClass) => {
+  const sn = $("#splash-notification");
+  if (sn.html()) return;
+  sn.html(message);
+  sn.addClass(categoryClass);
+  sn.fadeIn();
+  setTimeout(() => {
+    sn.fadeOut();
+    setTimeout(() => {
+      sn.html("");
+      sn.removeClass(categoryClass);
+    }, 450);
+  }, 3000);
+}
+
+const setupScreensaver = () => {
+  if (screensaverTimeoutSeconds > 0) {
+    setInterval(() => {
+      let screensaver = document.getElementById('screensaver');
+      let video = getVideoPlayer();
+      if (isMediaPlaying(video) || cursorVisible) {
+        idleTime = 0;
+      }
+      if (idleTime >= screensaverTimeoutSeconds) {
+        if (screensaver.style.visibility === 'hidden') {
+          screensaver.style.visibility = 'visible';
+          playBGVideo(false);
+          startScreensaver(); // depends on upstream screensaver.js import
+        }
+        if (idleTime > screensaverTimeoutSeconds + 36000) idleTime = screensaverTimeoutSeconds;
+      } else {
+        if (screensaver.style.visibility === 'visible') {
+          screensaver.style.visibility = 'hidden';
+          stopScreensaver(); // depends on upstream screensaver.js import
+          updateBackgroundMediaState(true);
+        }
+      }
+      idleTime++;
+    }, 1000)
+  }
+}
+
+// Server-rendered once at page load, then kept current from now_playing updates
+// because the splash screen is a long-lived display that never reloads.
+let sessionName = null;
+
+const renderSessionName = () => {
+  $("#session-name")
+    .text(sessionName || "")
+    .toggle(Boolean(sessionName) && !PikaraokeConfig.hideSessionName);
+};
+
+const handleNowPlayingUpdate = (np) => {
+  nowPlaying = np;
+  if (np.session_name !== sessionName) {
+    sessionName = np.session_name;
+    renderSessionName();
+  }
+  currentPlaybackId = np.playback_id ?? null;
+
+  // The server ended the song (skip, clear queue, transpose): stop rather than
+  // play on from the buffer, whose stream files have already been deleted.
+  if (!np.now_playing_url && currentVideoUrl) {
+    stopVideoPlayback();
+  }
+
+  if (np.now_playing) {
+
+    // Handle updating now playing HTML
+    let nowPlayingHtml = `<span>${np.now_playing}</span> `;
+    if (np.now_playing_transpose !== 0) {
+      nowPlayingHtml += `<span class='is-size-6 has-text-success'><b>Key</b>: ${getSemitonesLabel(np.now_playing_transpose)} </span>`;
+    }
+    $("#now-playing-song").html(nowPlayingHtml);
+    $("#now-playing-singer").html(np.now_playing_user);
+    $("#now-playing").fadeIn();
+  } else {
+    $("#now-playing").fadeOut();
+  }
+  if (np.up_next) {
+    $("#up-next-song").html(np.up_next);
+    $("#up-next-singer").html(np.next_user);
+    $("#up-next").fadeIn();
+  } else {
+    $("#up-next").fadeOut();
+  }
+
+  // Update bg music and video state
+  if (np.now_playing || np.up_next) {
+    idleTime = 0;
+  }
+  updateBackgroundMediaState();
+
+  const video = getVideoPlayer();
+
+  // Setup ASS subtitle file if found
+  const subtitleUrl = np.now_playing_subtitle_url;
+  if (octopusInstance) {
+    octopusInstance.dispose();
+    octopusInstance = null;
+  }
+  if (subtitleUrl && video) {
+    const options = {
+      video: video,
+      subUrl: subtitleUrl,
+      fonts: [
+        withBasePath("/static/fonts/Arial.ttf"),
+        withBasePath("/static/fonts/DroidSansFallback.ttf"),
+      ],
+      debug: true,
+      workerUrl: withBasePath("/static/js/subtitles-octopus-worker.js")
+    };
+    try {
+      octopusInstance = new SubtitlesOctopus(options);
+      scaleSubtitleCanvas();
+    } catch (e) { console.error(e); }
+  }
+
+  if (np.now_playing_url && np.now_playing_url !== currentVideoUrl) {
+    currentVideoUrl = np.now_playing_url;
+    const streamUrl = np.now_playing_url;
+    $("#video-source").attr("src", "");
+    video.load();
+    $("#video-source").attr("src", streamUrl);
+
+    // A screen loading mid-song - a second screen, or this one reloaded - picks the
+    // song up where it is. hls.js starts there; a plain <video> seeks once it can.
+    const resumeAt = np.now_playing_position || 0;
+    const seekOnceLoaded = () => {
+      if (resumeAt) {
+        video.addEventListener("loadedmetadata", () => { video.currentTime = resumeAt; }, { once: true });
+      }
+    };
+
+    if (streamUrl.endsWith('.m3u8')) {
+      const useNativeHLS = video.canPlayType('application/vnd.apple.mpegurl') && !isChrome && !isEdge && !isMobileSafari;
+      if (useNativeHLS) {
+        video.src = streamUrl;
+        seekOnceLoaded();
+      } else {
+        if (hlsInstance) { hlsInstance.destroy(); hlsInstance = null; }
+        hlsInstance = new Hls({ startPosition: resumeAt });
+        hlsInstance.loadSource(streamUrl);
+        hlsInstance.attachMedia(video);
+      }
+    } else {
+      seekOnceLoaded();
+    }
+
+    video.load();
+    if (volume !== np.volume) {
+      volume = np.volume;
+      video.volume = volume;
+    }
+
+    const duration = $("#duration");
+    if (np.now_playing_duration) {
+      duration.text(`/${formatTime(np.now_playing_duration)}`);
+      duration.show();
+    } else {
+      duration.hide();
+    }
+
+    $("#video-container").show();
+
+    video.play().catch(err => {
+      console.error('Play failed:', err);
+      // Retry once if it was an autoplay block
+      setTimeout(() => video.play(), 1000);
+    });
+
+    const loadedPlaybackId = currentPlaybackId;
+    setTimeout(() => {
+      // Only the master ends a song, and only the one this timer was armed for.
+      if (!isMaster || loadedPlaybackId !== currentPlaybackId) return;
+      // A paused video is a failure too: a blocked autoplay stays silent forever.
+      if (!isMediaPlaying(video) && !nowPlaying.is_paused) {
+        endSong("failed to start");
+      }
+    }, playbackStartTimeout);
+  }
+}
+
+async function loadNowPlaying() {
+  handleNowPlayingUpdate(await $.get(withBasePath("/api/now_playing")));
+}
+
+const setupOverlayMenus = () => {
+  if (PikaraokeConfig.hideOverlay) {
+    $('#bottom-container').hide();
+    $('#top-container').hide();
+  }
+  $("#menu a").fadeOut(); // start hidden
+  const triggerInactivity = () => {
+    mouseTimer = null;
+    document.body.style.cursor = 'none';
+    cursorVisible = false;
+    $("#menu a").fadeOut();
+    if (PikaraokeConfig.showSplashClock) {
+      setTimeout(() => {
+        if (!cursorVisible) $("#clock").fadeIn();
+      }, 1000);
+    }
+    menuButtonVisible = false;
+  };
+
+  document.onmousemove = function () {
+    if (mouseTimer) window.clearTimeout(mouseTimer);
+    if (!cursorVisible) {
+      document.body.style.cursor = 'default';
+      cursorVisible = true;
+    }
+    if (!menuButtonVisible) {
+      $("#menu a").fadeIn();
+      $("#clock").hide();
+      menuButtonVisible = true;
+    }
+    mouseTimer = window.setTimeout(triggerInactivity, 5000);
+  };
+
+  // Set initial state to hidden
+  triggerInactivity();
+  $('#menu a').click(function () {
+    if (showMenu) {
+      $('#menu-container').hide();
+      $('#menu-container iframe').attr('src', '');
+      showMenu = false;
+    } else {
+      setUserCookie();
+      $("#menu-container").show();
+      $("#menu-container iframe").attr("src", withBasePath("/"));
+      showMenu = true;
+    }
+  });
+  $('#menu-background').click(function () {
+    if (showMenu) {
+      $(".navbar-burger").click();
+    }
+  });
+}
+
+const setupVideoPlayer = () => {
+  $('#video-container').hide();
+  const video = getVideoPlayer();
+  video.addEventListener("play", () => {
+    $("#video-container").show();
+    if (isMaster) {
+      // Capture the id now, not when the timer fires: a song skipped inside this
+      // delay must not have its late "started" report applied to the next one.
+      const startedPlaybackId = currentPlaybackId;
+      setTimeout(() => { socket.emit("start_song", startedPlaybackId) }, 1200);
+    }
+  });
+
+  // Master reports playback position to server
+  setInterval(() => {
+    if (isMaster && isMediaPlaying(video)) {
+      socket.emit("playback_position", video.currentTime);
+    }
+  }, 1000);
+
+  video.addEventListener("ended", () => { endSong("complete", true); });
+  video.addEventListener("timeupdate", (e) => { $("#current").text(formatTime(video.currentTime)); });
+  $("#video source")[0].addEventListener("error", (e) => {
+    if (isMediaPlaying(video)) {
+      endSong("error while playing");
+    }
+  });
+  window.addEventListener(
+    'beforeunload',
+    function (event) {
+      if (isMediaPlaying(video)) {
+        endSong("splash screen closed");
+      }
+    },
+    true
+  );
+}
+
+const setupBackgroundMusicPlayer = () => {
+  $.get(withBasePath("/api/bg_playlist"), function (data) {
+    if (data) bg_playlist = data;
+  });
+  const bgMusic = getBackgroundMusicPlayer();
+  bgMusic.addEventListener("ended", async () => {
+    bgMusic.setAttribute('src', getNextBgMusicSong());
+    await bgMusic.load();
+    await bgMusic.play();
+  });
+}
+
+const handleUnsupportedBrowser = () => {
+  if (!isSupportedBrowser) {
+    let modalContents = document.getElementById("permissions-modal-content");
+    let warningMessage = document.createElement("p");
+    warningMessage.classList.add("notification", "is-warning");
+    warningMessage.innerHTML =
+      PikaraokeConfig.translations.unsupportedBrowser;
+    modalContents.prepend(warningMessage);
+  }
+}
+
+const startClock = () => {
+  if (clockIntervalId) return;
+  const update = () => {
+    const el = document.getElementById('clock');
+    if (el) el.textContent = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: true });
+  };
+  update();
+  clockIntervalId = setInterval(update, 1000);
+}
+
+const stopClock = () => {
+  if (!clockIntervalId) return;
+  clearInterval(clockIntervalId);
+  clockIntervalId = null;
+}
+
+const PREFERENCE_EFFECTS = {
+  disable_bg_video:    (v) => { PikaraokeConfig.disableBgVideo = v; applyBackgroundMediaState(); },
+  disable_bg_music:    (v) => { PikaraokeConfig.disableBgMusic = v; applyBackgroundMediaState(); },
+  disable_score:       (v) => { PikaraokeConfig.disableScore = v; },
+  show_splash_clock:   (v) => {
+    PikaraokeConfig.showSplashClock = v;
+    v ? startClock() : (stopClock(), $("#clock").hide());
+  },
+  hide_overlay:        (v) => {
+    PikaraokeConfig.hideOverlay = v;
+    $("#bottom-container, #top-container").toggle(!v);
+  },
+  hide_url:            (v) => { $(".splash-url").toggle(!v); },
+  hide_qr_code:        (v) => { $(".splash-qr-image").toggle(!v); },
+  hide_logo:           (v) => { $("#logo-container img.logo").toggle(!v); },
+  hide_session_name:   (v) => {
+    PikaraokeConfig.hideSessionName = v;
+    renderSessionName();
+  },
+  bg_music_volume:     (v) => {
+    PikaraokeConfig.bgMusicVolume = v;
+    const player = getBackgroundMusicPlayer();
+    if (isMediaPlaying(player)) $(player).animate({ volume: v }, 1000);
+  },
+  screensaver_timeout: (v) => {
+    screensaverTimeoutSeconds = v;
+    PikaraokeConfig.screensaverTimeout = v;
+  },
+  splash_scale:        (v) => {
+    PikaraokeConfig.splashScale = v;
+    applyUIScale(effectiveUIScale());
+  },
+};
+
+const parsePreferenceValue = (value) => {
+  if (typeof value !== "string") return value;
+  if (value === "True") return true;
+  if (value === "False") return false;
+  const num = Number(value);
+  return !isNaN(num) && value.trim() !== "" ? num : value;
+};
+
+const applyPreferenceUpdate = (data) => {
+  const effect = PREFERENCE_EFFECTS[data.key];
+  if (effect) effect(parsePreferenceValue(data.value));
+};
+
+const applyPreferencesReset = (defaults) => {
+  Object.entries(defaults).forEach(([key, value]) => applyPreferenceUpdate({ key, value }));
+};
+
+const setupSocketEvents = () => {
+  socket.on('connect', () => {
+    console.log('Socket connected');
+    socket.emit("register_splash");
+  });
+  socket.on('splash_role', (role) => {
+    isMaster = (role === "master");
+    // A screen caught mid-catch-up must not set the pace for the others.
+    if (isMaster) getVideoPlayer().playbackRate = 1;
+    console.log("Splash role assigned:", role, isMaster ? "(Master active)" : "(Slave active - read-only)");
+  });
+  socket.on('connect_error', (error) => {
+    console.error('Connection error:', error);
+    flashNotification(PikaraokeConfig.translations.socketConnectionLost, "is-danger");
+  });
+  socket.on('disconnect', (reason) => {
+    console.warn('Socket disconnected:', reason);
+    flashNotification(PikaraokeConfig.translations.socketConnectionLost, "is-danger");
+  });
+  socket.on('pause', () => {
+    const video = getVideoPlayer();
+    const currVolume = video.volume;
+    if (!video.paused) {
+      $(video).animate({ volume: 0 }, 1000, () => {
+        video.pause();
+        video.volume = currVolume;
+      });
+    }
+  });
+  socket.on('play', () => {
+    const video = getVideoPlayer();
+    const currVolume = video.volume;
+    if (video.paused) {
+      video.play();
+      video.volume = 0;
+      $(video).animate({ volume: currVolume }, 1000);
+    }
+  });
+  socket.on('skip', (reason) => {
+    const video = getVideoPlayer();
+    const currVolume = video.volume;
+    if (isMediaPlaying(video)) {
+      $(video).animate({ volume: 0 }, 1000, () => {
+        video.pause();
+        video.volume = currVolume;
+        hideVideo();
+      });
+    } else {
+      video.pause();
+      hideVideo();
+    }
+  });
+  socket.on('volume', (val) => {
+    const video = getVideoPlayer();
+    if (val === "up") {
+      video.volume = Math.min(1, video.volume + 0.1);
+    } else if (val === "down") {
+      video.volume = Math.max(0, video.volume - 0.1);
+    } else {
+      video.volume = val;
+    }
+  });
+  socket.on('restart', () => {
+    const video = getVideoPlayer();
+    video.currentTime = 0;
+    if (video.paused) video.play();
+  });
+  socket.on("notification", (data) => {
+    const notification = data.split("::");
+    const message = notification[0];
+    const categoryClass = notification.length > 1 ? notification[1] : "is-primary";
+    flashNotification(message, categoryClass);
+    if (isMaster) {
+      socket.emit("clear_notification");
+    }
+  });
+  socket.on("now_playing", handleNowPlayingUpdate);
+  socket.on("preferences_update", applyPreferenceUpdate);
+  socket.on("preferences_reset", applyPreferencesReset);
+  socket.on("score_phrases_update", (phrases) => { scoreReviews = phrases; });
+
+  socket.on("playback_position", (position) => {
+    if (!isMaster) {
+      const video = getVideoPlayer();
+      if (isMediaPlaying(video)) {
+        // Positive when this screen is behind the master.
+        const drift = position - video.currentTime;
+        if (Math.abs(drift) > 2) {
+          console.log("Slave drifting, syncing position to:", position);
+          video.currentTime = position;
+        } else {
+          // A seek lands a few tenths short, which is an audible echo beside the
+          // master, so close a small gap by playing up to 10% fast or slow.
+          video.playbackRate = Math.abs(drift) < 0.05 ? 1 : 1 + Math.max(-0.1, Math.min(0.1, drift / 2));
+        }
+      }
+    }
+  });
+}
+
+const handleSocketRecovery = () => {
+  // A socket may disconnect if the tab is backgrounded for a while
+  // Reconnect and configure event listeners when tab becomes visible again
+  document.addEventListener("visibilitychange", function () {
+    if (document.visibilityState === 'visible') {
+      autoplayConfirmed && loadNowPlaying();
+      if (!socket.connected) {
+        socket = io({ path: window.pikaraokeConfig.socketioPath });
+        setupSocketEvents();
+      }
+    }
+  });
+}
+
+const UI_SCALE_TARGETS = [
+  // The logo and session name scale as one column: scaled apart, each grows
+  // about its own centre and the two overlap.
+  { selector: '#logo-container > div', origin: null },
+  { selector: '#top-container', origin: 'top right' },
+  { selector: '#ap-container', origin: 'top left' },
+  { selector: '#qr-code', origin: 'bottom left' },
+  { selector: '#up-next', origin: 'bottom right' },
+  { selector: '#dvd', origin: null },
+  { selector: '#your-score-text', origin: null },
+  { selector: '#score-number-text', origin: null },
+  { selector: '#score-review-text', origin: null },
+  { selector: '#splash-notification', origin: 'top left' },
+  { selector: '#clock', origin: 'top left' },
+];
+
+// ?scale= overrides the stored preference for this screen only, so a second
+// display of a different size can differ from the TV.
+const urlUIScale = parseFloat(new URLSearchParams(window.location.search).get('scale'));
+
+const effectiveUIScale = () => isNaN(urlUIScale) ? PikaraokeConfig.splashScale : urlUIScale;
+
+const setScaleTransform = (el, origin) => {
+  el.style.transform = uiScale ? `scale(${uiScale})` : '';
+  el.style.transformOrigin = uiScale && origin ? origin : '';
+}
+
+// The canvas SubtitlesOctopus creates beside the video, if a song has subtitles.
+const scaleSubtitleCanvas = () => {
+  const canvas = getVideoPlayer().parentNode.querySelector('canvas');
+  if (canvas) setScaleTransform(canvas, 'bottom center');
+}
+
+const applyUIScale = (scale) => {
+  // At 1 the transform is cleared, not set to scale(1): any transform starts a
+  // new stacking context, so an unscaled screen would not render as it did.
+  uiScale = scale > 0 && scale !== 1 ? scale : null;
+  UI_SCALE_TARGETS.forEach(({ selector, origin }) => {
+    const el = document.querySelector(selector);
+    if (el) setScaleTransform(el, origin);
+  });
+  scaleSubtitleCanvas();
+}
+
+// Document ready procedures
+
+$(function () {
+  // Setup various features and listeners
+  applyUIScale(effectiveUIScale());
+  if (PikaraokeConfig.showSplashClock) startClock();
+  setupScreensaver();
+  setupOverlayMenus();
+  setupVideoPlayer();
+  setupBackgroundMusicPlayer();
+
+  // Handle browser compatibility
+  handleUnsupportedBrowser();
+  testAutoplayCapability();
+});
+
+
+// Setup sockets and recovery outside of document ready to prevent race conditions
+setupSocketEvents();
+handleSocketRecovery();
+
+// Fallback: if socket connected before listeners were attached, register now
+if (socket.connected) {
+  console.log('Socket already connected, registering splash...');
+  socket.emit("register_splash");
+}

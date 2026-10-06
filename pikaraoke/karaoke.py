@@ -1,0 +1,745 @@
+"""Core karaoke engine for managing songs, queue, and playback."""
+
+import logging
+import os
+import socket
+import subprocess
+import threading
+import time
+from typing import Any
+from urllib.parse import urlsplit
+
+import qrcode
+from flask_babel import _
+from qrcode.image.pure import PyPNGImage
+
+from pikaraoke.lib.download_manager import DownloadManager
+from pikaraoke.lib.events import EventSystem
+from pikaraoke.lib.ffmpeg import (
+    get_ffmpeg_version,
+    is_transpose_enabled,
+    supports_hardware_h264_encoding,
+)
+from pikaraoke.lib.get_platform import (
+    get_data_directory,
+    get_os_version,
+    get_platform,
+    is_raspberry_pi,
+)
+from pikaraoke.lib.karaoke_database import KaraokeDatabase
+from pikaraoke.lib.keep_awake import KeepAwake
+from pikaraoke.lib.library_scanner import LibraryScanner, ScanResult
+from pikaraoke.lib.network import get_ip
+from pikaraoke.lib.play_history_manager import PlayHistoryManager
+from pikaraoke.lib.playback_controller import PlaybackController
+from pikaraoke.lib.preference_manager import PreferenceManager
+from pikaraoke.lib.queue_manager import QueueManager
+from pikaraoke.lib.song_manager import SongManager
+from pikaraoke.lib.sound_manager import SoundManager
+from pikaraoke.lib.url_prefix import append_base_path_to_url
+from pikaraoke.lib.youtube_dl import get_youtubedl_version, upgrade_youtubedl
+from pikaraoke.version import __version__ as VERSION
+
+
+class SongInUseError(Exception):
+    """Raised when a rename targets the file playback has claimed."""
+
+
+class Karaoke:
+    """Main karaoke engine managing songs, queue, and playback.
+
+    This class handles all core karaoke functionality including:
+    - Song queue management
+    - YouTube video downloading
+    - Playback coordination via PlaybackController
+    - User preferences
+    - QR code generation
+
+    Attributes:
+        available_songs: List of available song file paths.
+        queue_manager: Queue management for songs.
+        playback_controller: Playback state and stream coordination.
+        volume: Current volume level (0.0 to 1.0).
+    """
+
+    song_manager: SongManager
+    queue_manager: QueueManager
+    playback_controller: PlaybackController
+    play_history: PlayHistoryManager
+
+    now_playing_notification: str | None = None
+    volume: float
+
+    qr_code_path: str | None = None
+    base_path: str = os.path.dirname(__file__)
+    loop_interval: int = 500  # in milliseconds
+    default_logo_path: str = os.path.join(base_path, "static", "images", "logo.png")
+    default_bg_music_path: str = os.path.join(base_path, "static", "music")
+    default_bg_video_path: str = os.path.join(base_path, "static", "video", "night_sea.mp4")
+    screensaver_timeout: int
+
+    normalize_audio: bool
+    show_splash_clock: bool
+
+    # Download manager for serialized downloads
+    download_manager: DownloadManager
+
+    # Microphone manager for server-side mic passthrough
+    sound_manager: SoundManager
+
+    # Event system and preferences
+    events: EventSystem
+    preferences: PreferenceManager
+
+    def __init__(
+        self,
+        # Non-preference parameters (keep their own defaults)
+        additional_ytdl_args: str | None = None,
+        bg_music_path: str | None = None,
+        bg_video_path: str | None = None,
+        config_file_path: str = "config.ini",
+        download_path: str = "/usr/lib/pikaraoke/songs",
+        hide_splash_screen: bool | None = None,
+        log_level: int = logging.DEBUG,
+        logo_path: str | None = None,
+        port: int = 5555,
+        prefer_hostname: bool | None = None,
+        preferred_language: str | None = None,
+        socketio=None,
+        streaming_format: str = "hls",
+        url: str | None = None,
+        url_base_path: str = "",
+        youtubedl_proxy: str | None = None,
+        # Preference parameters (defaults from PreferenceManager.DEFAULTS)
+        avsync: float | None = None,
+        bg_music_volume: float | None = None,
+        browse_results_per_page: int | None = None,
+        buffer_size: int | None = None,
+        cdg_pixel_scaling: bool | None = None,
+        complete_transcode_before_play: bool | None = None,
+        disable_bg_music: bool | None = None,
+        disable_bg_video: bool | None = None,
+        disable_score: bool | None = None,
+        enable_fair_queue: bool | None = None,
+        enable_mic_passthrough: bool | None = None,
+        hide_notifications: bool | None = None,
+        hide_overlay: bool | None = None,
+        hide_logo: bool | None = None,
+        hide_qr_code: bool | None = None,
+        hide_session_name: bool | None = None,
+        hide_url: bool | None = None,
+        high_quality: bool | None = None,
+        keep_awake: bool | None = None,
+        limit_user_songs_by: int | None = None,
+        normalize_audio: bool | None = None,
+        screensaver_timeout: int | None = None,
+        show_splash_clock: bool | None = None,
+        splash_delay: int | None = None,
+        splash_scale: float | None = None,
+        volume: float | None = None,
+        enable_title_tidy: bool | None = None,
+        enable_folder_browsing: bool | None = None,
+    ) -> None:
+        """Initialize the Karaoke instance.
+
+        Args:
+            port: HTTP server port number.
+            download_path: Directory path for downloaded songs.
+            hide_url: Hide the URL on the splash screen.
+            hide_qr_code: Hide the QR code on the splash screen.
+            hide_session_name: Hide the session name under the splash screen logo.
+            hide_logo: Hide the logo in the centre of the splash screen.
+            hide_notifications: Disable notification popups.
+            hide_splash_screen: Run in headless mode.
+            high_quality: Download higher quality videos (up to 1080p).
+            volume: Default volume level (0.0 to 1.0).
+            normalize_audio: Apply loudness normalization.
+            complete_transcode_before_play: Buffer entire file before playback.
+            buffer_size: Transcode buffer size in KB.
+            log_level: Logging level (e.g., logging.DEBUG).
+            splash_delay: Seconds to wait between songs.
+            youtubedl_proxy: Proxy URL for yt-dlp.
+            logo_path: Custom logo image path.
+            hide_overlay: Hide video overlay.
+            keep_awake: Prevent the host machine from sleeping.
+            screensaver_timeout: Screensaver activation delay in seconds.
+            splash_scale: Size multiplier for the splash screen overlays.
+            url: Override auto-detected URL.
+            prefer_hostname: Use hostname instead of IP in URL.
+            disable_bg_music: Disable background music.
+            bg_music_volume: Background music volume (0.0 to 1.0).
+            bg_music_path: Directory for background music files.
+            bg_video_path: Path to a background video, or a directory of them.
+            disable_bg_video: Disable background video.
+            disable_score: Disable score screen.
+            limit_user_songs_by: Max songs per user in queue (0 = unlimited).
+            enable_fair_queue: Order the queue round-robin so singers take turns.
+            avsync: Audio/video sync adjustment in seconds.
+            config_file_path: Path to config.ini file.
+            cdg_pixel_scaling: Enable CDG pixel scaling.
+            streaming_format: Video streaming format ('hls' or 'mp4').
+            browse_results_per_page: Number of search results per page.
+            additional_ytdl_args: Additional yt-dlp command arguments.
+            socketio: SocketIO instance for real-time event emission.
+            preferred_language: Language code for UI (e.g., 'en', 'de_DE').
+            enable_folder_browsing: Offer a Folders view on the Songs page.
+        """
+        logging.basicConfig(
+            format="[%(asctime)s] %(levelname)s: %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+            level=int(log_level),
+        )
+
+        # Initialize event system and preferences (foundation for all components)
+        self.events = EventSystem()
+        self.preferences = PreferenceManager(config_file_path, target=self)
+
+        # Platform-specific initializations
+        self.platform = get_platform()
+        self.os_version = get_os_version()
+        self.ffmpeg_version = get_ffmpeg_version()
+        self.is_transpose_enabled = is_transpose_enabled()
+        self.supports_hardware_h264_encoding = supports_hardware_h264_encoding()
+        self.youtubedl_version = get_youtubedl_version()
+        self.is_raspberry_pi = is_raspberry_pi()
+
+        logging.info("PiKaraoke version: " + VERSION)
+
+        # Set non-preference attributes (not stored in config)
+        self.port = port
+        self.hide_splash_screen = hide_splash_screen
+        # Experimental launch-only gate: must be re-passed each run, never persisted to config.
+        self.enable_mic_passthrough = enable_mic_passthrough
+        self.download_path = download_path
+        self.log_level = log_level
+        self.youtubedl_proxy = youtubedl_proxy
+        self.additional_ytdl_args = additional_ytdl_args
+        self.logo_path = self.default_logo_path if logo_path is None else logo_path
+        self.prefer_hostname = prefer_hostname
+        self.bg_music_path = self.default_bg_music_path if bg_music_path is None else bg_music_path
+        self.bg_video_path = self.default_bg_video_path if bg_video_path is None else bg_video_path
+        self.streaming_format = streaming_format
+        self.socketio = socketio
+        self.url_override = url
+        self.url_base_path = url_base_path
+        self.url = self.get_url()
+
+        # Must exist before preferences are applied: the keep_awake setter uses it.
+        self._keep_awake = KeepAwake()
+
+        # Load all preference-driven attributes from config (with CLI overrides as fallback)
+        cli_args = {k: v for k, v in locals().items() if k != "self"}
+        self._load_preferences(**cli_args)
+
+        # Log the settings to debug level
+        self.log_settings_to_debug()
+
+        # Initialize database, scanner, and song manager (startup runs at end of __init__)
+        self.db = KaraokeDatabase()
+        self.song_manager = SongManager(
+            self.download_path,
+            db=self.db,
+            events=self.events,
+            # Preference attributes are set on self by PreferenceManager.load().
+            get_title_tidy=lambda: self.enable_title_tidy,  # pylint: disable=no-member
+        )
+        self._scanner = LibraryScanner(self.db)
+        self._sync_lock = threading.Lock()
+        # Held across "pop the next song and claim it", and by rename_song, so a
+        # rename cannot land on a song that has left the queue but is not yet claimed.
+        self._playback_lock = threading.Lock()
+
+        self.generate_qr_code()
+
+        # Set preferred language from command line if provided (persists to config)
+        if preferred_language:
+            self.preferences.set("preferred_language", preferred_language)
+            logging.info(f"Setting preferred language to: {preferred_language}")
+
+        # Initialize playback controller for video playback and FFmpeg coordination
+        self.playback_controller = PlaybackController(
+            preferences=self.preferences,
+            events=self.events,
+            filename_from_path=self.song_manager.display_name_from_path,
+            streaming_format=self.streaming_format,
+            base_path=self.url_base_path,
+        )
+
+        # Event bridging: the coordinator wires manager events to the UI (SocketIO/notifications).
+        self.events.on("notification", self.log_and_send)
+        self._relay_to_browser("queue_update")
+        self.events.on("now_playing_update", self.update_now_playing_socket)
+        self.events.on("playback_started", self.update_now_playing_socket)
+        # song_ended carries a reason this listener has no use for.
+        self.events.on("song_ended", lambda *_: self.update_now_playing_socket())
+        # The splash screen carries the session name and is a display that never
+        # reloads, so starting or ending a session has to reach it. Sessions
+        # change between songs, when no playback event is coming.
+        self.events.on("session_changed", self.update_now_playing_socket)
+        # The play log and the session list re-read themselves on this. Separate
+        # from now_playing, which also fires on pauses and queue edits that leave
+        # the log untouched, and which is emitted before the row is written.
+        self._relay_to_browser("play_logged")
+        self.events.on("skip_requested", lambda: self.playback_controller.skip(False))
+        self.events.on("song_downloaded", self.register_downloaded_song)
+        self._relay_to_browser("sync_started")
+        self._relay_to_browser("sync_finished")
+
+        # Initialize microphone manager for server-side mic passthrough
+        self.sound_manager = SoundManager(
+            preferences=self.preferences,
+            events=self.events,
+            enabled=self.enable_mic_passthrough,
+        )
+        self.sound_manager.start()
+
+        # Initialize queue manager
+        self.queue_manager = QueueManager(
+            preferences=self.preferences,
+            events=self.events,
+            get_now_playing_user=lambda: self.playback_controller.now_playing_user,
+            filename_from_path=self.song_manager.display_name_from_path,
+            get_available_songs=lambda: self.song_manager.songs,
+            # Bound late: play history is built below.
+            get_turns_taken=lambda: self.play_history.get_turns_taken(),
+        )
+
+        # Play history recording and reporting (subscribes to song_ended itself)
+        self.play_history = PlayHistoryManager(db=self.db, events=self.events)
+
+        # Initialize and start download manager
+        self.download_manager = DownloadManager(
+            events=self.events,
+            preferences=self.preferences,
+            song_manager=self.song_manager,
+            queue_manager=self.queue_manager,
+            download_path=self.download_path,
+            youtubedl_proxy=self.youtubedl_proxy,
+            additional_ytdl_args=self.additional_ytdl_args,
+        )
+        self.download_manager.start()
+
+        # Song library startup: warm cache from DB or blocking cold scan
+        paths = self.db.get_all_song_paths()
+        if paths:
+            self.song_manager.songs.update(paths)
+            logging.info("Loaded songs from database, syncing in the background")
+            self.sync_library()
+        else:
+            logging.info("No existing database found, scanning song directory")
+            result = self._scanner.scan(self.download_path)
+            self._apply_scan_result(result)
+
+    def _apply_scan_result(self, result: ScanResult) -> None:
+        """Update SongList and emit notifications after a scan."""
+        if result.added or result.moved or result.deleted:
+            self.song_manager.songs.update(self.db.get_all_song_paths())
+            parts = [
+                label
+                for count, label in [
+                    (result.added, f"{result.added} added"),
+                    (result.moved, f"{result.moved} moved"),
+                    (result.deleted, f"{result.deleted} removed"),
+                ]
+                if count
+            ]
+            self.events.emit("notification", f"Library updated: {', '.join(parts)}", "success")
+
+        if result.circuit_tripped:
+            logging.error(
+                f"Circuit breaker tripped: >50% of songs missing. "
+                f"Drive may be unmounted: {self.download_path}"
+            )
+            self.events.emit(
+                "notification",
+                f"Song scan halted: too many songs missing. "
+                f"Check your song directory: {self.download_path}. "
+                "Click 'Sync Now' to retry after fixing.",
+                "danger",
+            )
+            return
+
+        logging.info(f"Scan complete: {result}")
+
+    def sync_library(self) -> bool:
+        """Trigger a background library scan.
+
+        Used for both warm startup reconciliation and admin 'Sync Now'.
+        Returns False if a sync is already in progress.
+        """
+        if not self._sync_lock.acquire(blocking=False):
+            return False
+        self.events.emit("sync_started")
+        thread = threading.Thread(target=self._background_sync, daemon=True)
+        thread.start()
+        return True
+
+    def _background_sync(self) -> None:
+        try:
+            logging.info(f"Background library scan starting: {self.download_path}")
+            result = self._scanner.scan(self.download_path)
+            self._apply_scan_result(result)
+        finally:
+            self._sync_lock.release()
+            self.events.emit("sync_finished")
+
+    def _load_preferences(self, **cli_overrides: Any) -> None:
+        """Load preference-driven attributes from config file.
+
+        Priority: CLI argument (if provided) > config file > PreferenceManager.DEFAULTS
+        """
+        self.preferences.apply_all(**cli_overrides)
+
+    @property
+    def keep_awake(self) -> bool:
+        """Whether the host is being held awake.
+
+        A property so that preference writes acquire or release the wake lock
+        immediately, rather than at the next restart.
+        """
+        return self._keep_awake.active
+
+    @keep_awake.setter
+    def keep_awake(self, enabled: bool) -> None:
+        if enabled:
+            self._keep_awake.start()
+        else:
+            self._keep_awake.stop()
+
+    def get_url(self):
+        """Get the URL for accessing the PiKaraoke web interface.
+
+        On Raspberry Pi, retries getting the IP address for up to 30 seconds
+        in case the network is still initializing at startup.
+
+        Returns:
+            URL string in format http://ip:port
+        """
+        if self.is_raspberry_pi:
+            # retry in case pi is still starting up
+            # and doesn't have an IP yet (occurs when launched from /etc/rc.local)
+            end_time = int(time.time()) + 30
+            while int(time.time()) < end_time:
+                addresses_str = (
+                    subprocess.check_output(["hostname", "-I"]).strip().decode("utf-8", "ignore")
+                )
+                addresses = addresses_str.split(" ")
+                self.ip = addresses[0]
+                if len(self.ip) < 7:
+                    logging.debug("Couldn't get IP, retrying....")
+                else:
+                    break
+        else:
+            self.ip = get_ip(self.platform)
+
+        logging.debug("IP address (for QR code and splash screen): " + self.ip)
+
+        if self.url_override != None:
+            logging.debug("Overriding URL with " + self.url_override)
+            url = self.url_override
+        else:
+            if self.prefer_hostname:
+                url = f"http://{socket.getfqdn().lower()}:{self.port}"
+            else:
+                url = f"http://{self.ip}:{self.port}"
+
+        if self.url_override is None:
+            return append_base_path_to_url(url, self.url_base_path)
+
+        split_url = urlsplit(url)
+        if split_url.path not in ("", "/"):
+            return url
+        return append_base_path_to_url(url, self.url_base_path)
+
+    def log_settings_to_debug(self) -> None:
+        """Log all current settings at debug level."""
+        output = ""
+        for key, value in sorted(vars(self).items()):
+            output += f"  {key}: {value}\n"
+        logging.debug("\n\n" + output)
+
+    def generate_qr_code(self) -> None:
+        """Generate a QR code image for the web interface URL."""
+        logging.debug("Generating URL QR code")
+        qr = qrcode.QRCode(
+            version=1,
+            box_size=1,
+            border=4,
+        )
+        qr.add_data(self.url)
+        qr.make()
+        img = qr.make_image(image_factory=PyPNGImage)
+        # Use writable data directory instead of program directory.
+        # Include the port so multiple instances on the same host don't
+        # overwrite each other's QR code (see issue #836).
+        data_dir = get_data_directory()
+        self.qr_code_path = os.path.join(data_dir, f"qrcode-{self.port}.png")
+        img.save(self.qr_code_path)  # type: ignore[arg-type]
+
+    def send_notification(self, message: str, color: str = "primary") -> None:
+        """Send a notification to the web interface.
+
+        Args:
+            message: Notification message text.
+            color: Bulma color class (primary, warning, success, danger).
+        """
+        # Color should be bulma compatible: primary, warning, success, danger
+        hide_notifications = self.preferences.get_or_default("hide_notifications")
+        if not hide_notifications:
+            # don't allow new messages to clobber existing commands, one message at a time
+            # other commands have a higher priority
+            if self.now_playing_notification != None:
+                return
+            self.now_playing_notification = message + "::is-" + color
+            # Emit notification via SocketIO for event-driven architecture
+            if self.socketio:
+                self.socketio.emit("notification", self.now_playing_notification, namespace="/")
+
+    def log_and_send(self, message: str, category: str = "info") -> None:
+        """Log a message and send it as a notification.
+
+        Args:
+            message: Message to log and display.
+            category: Message category (info, success, warning, danger).
+        """
+        # Category should be one of: info, success, warning, danger
+        if category == "success":
+            logging.info(message)
+            self.send_notification(message, "success")
+        elif category == "warning":
+            logging.warning(message)
+            self.send_notification(message, "warning")
+        elif category == "danger":
+            logging.error(message)
+            self.send_notification(message, "danger")
+        else:
+            logging.info(message)
+            self.send_notification(message, "primary")
+
+    def is_song_in_use(self, song_path: str) -> bool:
+        """True if playback has claimed the file, or it is waiting in the queue."""
+        return (
+            self.playback_controller.now_playing_filename == song_path
+            or self.queue_manager.is_song_in_queue(song_path)
+        )
+
+    def rename_song(self, song_path: str, new_name: str) -> str:
+        """Rename a song and carry any queue entry over to the new path.
+
+        Raises SongInUseError if playback has claimed the file.
+        """
+        with self._playback_lock:
+            if self.playback_controller.now_playing_filename == song_path:
+                raise SongInUseError(song_path)
+            new_path = self.song_manager.rename(song_path, new_name)
+            requeued = self.queue_manager.update_song_path(
+                song_path, new_path, self.song_manager.display_name_from_path(new_path)
+            )
+        if requeued:
+            self.events.emit("queue_update")
+        return new_path
+
+    def transpose_current(self, semitones: int) -> None:
+        """Restart the current song with a new transpose value.
+
+        Args:
+            semitones: Number of semitones to transpose.
+        """
+        filename = self.playback_controller.now_playing_filename
+        user = self.playback_controller.now_playing_user
+        now_playing = self.playback_controller.now_playing
+
+        if filename is None or user is None:
+            logging.warning("Cannot transpose: no song currently playing")
+            return
+        # Insert the same song at the top of the queue with transposition.
+        # The stream ends but the performance does not, so play history keeps
+        # the existing play open rather than logging a second one.
+        queued, message = self.queue_manager.enqueue(filename, user, semitones, True)
+        if not queued:
+            # Skipping now would end the song with nothing to restart it: the
+            # singer loses their turn, and play history holds the play open
+            # waiting for a restart that is never coming.
+            self.log_and_send(str(message), "danger")
+            return
+        # MSG: Message shown after the song is transposed, first is the semitones and then the song name
+        self.log_and_send(_("Transposing by %s semitones: %s") % (semitones, now_playing))
+        self.playback_controller.skip(log_action=False, reason="transpose")
+
+    def volume_change(self, vol_level: float) -> bool:
+        """Set the volume level.
+
+        Args:
+            vol_level: Volume level (0.0 to 1.0).
+
+        Returns:
+            True after setting volume.
+        """
+        self.volume = vol_level
+        # MSG: Message shown after the volume is changed, will be followed by the volume level
+        self.log_and_send(_("Volume: %s") % (int(self.volume * 100)))
+        self.update_now_playing_socket()
+        return True
+
+    def vol_up(self) -> None:
+        """Increase volume by 10%."""
+        new_vol = min(self.volume + 0.1, 1.0)
+        self.volume_change(new_vol)
+        logging.debug(f"Increasing volume by 10%: {self.volume}")
+
+    def vol_down(self) -> None:
+        """Decrease volume by 10%."""
+        new_vol = max(self.volume - 0.1, 0.0)
+        self.volume_change(new_vol)
+        logging.debug(f"Decreasing volume by 10%: {self.volume}")
+
+    def restart(self) -> bool:
+        """Restart the current song from the beginning.
+
+        Returns:
+            True if successful, False if nothing playing.
+        """
+        if self.playback_controller.is_playing:
+            now_playing = self.playback_controller.now_playing
+            logging.info("Restarting: " + (now_playing or "unknown song"))
+            self.playback_controller.restart()
+            self.update_now_playing_socket()
+            return True
+        else:
+            logging.warning("Tried to restart, but no file is playing!")
+            return False
+
+    def stop(self) -> None:
+        """Stop the karaoke run loop."""
+        self.sound_manager.stop()
+        self._keep_awake.stop()
+        self.running = False
+
+    def handle_run_loop(self) -> None:
+        """Handle one iteration of the main run loop with a sleep interval."""
+        time.sleep(self.loop_interval / 1000)
+
+    def reset_now_playing_notification(self) -> None:
+        """Clear the current notification."""
+        self.now_playing_notification = None
+
+    def reset_now_playing(self) -> None:
+        """Reset all now playing state to defaults."""
+        self.playback_controller.reset_now_playing()
+        self.volume = self.preferences.get_or_default("volume")
+        self.update_now_playing_socket()
+
+    def get_now_playing(self) -> dict[str, Any]:
+        """Get the current playback state.
+
+        Returns:
+            Dictionary with now playing info, queue preview, and volume.
+        """
+        queue = self.queue_manager.queue
+        next_song = queue[0] if queue else None
+
+        # Get playback state from PlaybackController
+        playback_state = self.playback_controller.get_now_playing()
+
+        return {
+            **playback_state,
+            "up_next": next_song["title"] if next_song else None,
+            "next_user": next_song["user"] if next_song else None,
+            "volume": self.volume,
+            # The splash screen never reloads, so the session name rides this
+            # payload rather than being rendered once at page load.
+            "session_name": self.play_history.get_current_session_name(),
+            # Separate from session_name, which is None for an unnamed session
+            # too. The KJ singer field gates on this, and session_changed emits
+            # this payload, so starting a session elsewhere updates it live.
+            "has_session": self.play_history.has_active_session(),
+        }
+
+    def _relay_to_browser(self, event: str) -> None:
+        """Forward a payload-free manager event to the browser under the same name.
+
+        The browser is told only that something moved and refetches; socketio is
+        optional, so a Karaoke built without one drops the event.
+        """
+        self.events.on(
+            event, lambda: self.socketio.emit(event, namespace="/") if self.socketio else None
+        )
+
+    def update_now_playing_socket(self) -> None:
+        """Emit now_playing state change via SocketIO."""
+        if self.socketio:
+            self.socketio.emit("now_playing", self.get_now_playing(), namespace="/")
+
+    def register_downloaded_song(self, song_path: str, youtube_id: str | None) -> None:
+        """Add a finished download to the library, then announce it to browsers.
+
+        Registration happens first so the queue link the search page swaps in on
+        this event resolves against a song the library already knows about.
+        """
+        self.song_manager.register_download(song_path)
+        if self.socketio:
+            self.socketio.emit(
+                "song_downloaded",
+                {"youtube_id": youtube_id, "path": song_path},
+                namespace="/",
+            )
+
+    def run(self) -> None:
+        """Main run loop - processes queue and plays songs.
+
+        This method blocks until stop() is called or KeyboardInterrupt.
+        """
+        logging.debug("Starting PiKaraoke run loop")
+        logging.info(f"Connect the player host to: {self.url}/splash")
+        self.running = True
+        while self.running:
+            try:
+                # The two must agree: a "playing" flag with no song loaded stops
+                # the loop below from ever starting one.
+                if self.playback_controller.is_playing != (
+                    self.playback_controller.now_playing is not None
+                ):
+                    logging.info("Playback state out of sync, resetting")
+                    self.reset_now_playing()
+
+                # Start next song from queue if not currently playing
+                if len(self.queue_manager.queue) > 0 and not self.playback_controller.is_playing:
+                    self.reset_now_playing()
+                    # Splash delay between songs
+                    splash_delay = self.preferences.get_or_default("splash_delay")
+                    i = 0
+                    while i < (splash_delay * 1000):
+                        self.handle_run_loop()
+                        i += self.loop_interval
+
+                    # Pop song before playback to avoid UI flicker. Released
+                    # before play_file, which sleeps for seconds while transcoding.
+                    with self._playback_lock:
+                        song = self.queue_manager.pop_next()
+                        if song:
+                            self.playback_controller.claim(song["file"])
+                    if not song:
+                        continue
+                    result = self.playback_controller.play_file(
+                        song["file"], song["user"], song["semitones"]
+                    )
+
+                    # play_file() blocks only until the client connects, so this
+                    # always lands before the song_ended that completes it.
+                    if result.success:
+                        song_id, youtube_id = self.db.get_song_identity(song["file"])
+                        self.play_history.record_play(
+                            song_id,
+                            youtube_id,
+                            song["user"],
+                            self.song_manager.display_name_from_path(song["file"]),
+                        )
+                    elif result.error:
+                        self.log_and_send(result.error, "danger")
+
+                self.playback_controller.end_if_overran()
+                self.playback_controller.log_output()
+                self.handle_run_loop()
+            except KeyboardInterrupt:
+                logging.warning("Keyboard interrupt: Exiting pikaraoke...")
+                self.running = False
