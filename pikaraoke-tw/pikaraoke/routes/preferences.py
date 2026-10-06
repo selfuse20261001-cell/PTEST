@@ -1,0 +1,51 @@
+"""User preferences management routes."""
+
+from flask import jsonify
+from flask_smorest import Blueprint
+from marshmallow import Schema, fields
+
+from pikaraoke.lib.current_app import broadcast_event, get_karaoke_instance
+from pikaraoke.lib.preference_manager import PreferenceManager
+from pikaraoke.routes.splash import _get_active_score_phrases
+
+_SCORE_PHRASE_KEYS = {"low_score_phrases", "mid_score_phrases", "high_score_phrases"}
+
+preferences_bp = Blueprint("preferences", __name__)
+
+
+class ChangePreferenceForm(Schema):
+    pref = fields.String(
+        required=True, metadata={"description": "Name of the preference to change"}
+    )
+    val = fields.String(required=True, metadata={"description": "New value for the preference"})
+
+
+@preferences_bp.route("/api/change_preferences", methods=["POST"])
+@preferences_bp.arguments(ChangePreferenceForm, location="form")
+def change_preferences(form):
+    """Change a user preference setting."""
+    k = get_karaoke_instance()
+    preference = form["pref"]
+    val = form["val"]
+    success, message = k.preferences.set(preference, val)
+    if success:
+        broadcast_event("preferences_update", {"key": preference, "value": val})
+        if preference in _SCORE_PHRASE_KEYS:
+            broadcast_event("score_phrases_update", _get_active_score_phrases(k))
+    return jsonify([success, message])
+
+
+@preferences_bp.route("/api/clear_preferences", methods=["POST"])
+def clear_preferences():
+    """Reset all preferences to defaults.
+
+    Answers `[success, message]` like `change_preferences` beside it. The caller
+    re-renders /info, whose controls are server-rendered and listen for nothing.
+    """
+    k = get_karaoke_instance()
+    success, message = k.preferences.reset_all()
+    if success:
+        k.update_now_playing_socket()
+        broadcast_event("preferences_reset", PreferenceManager.DEFAULTS)
+        broadcast_event("score_phrases_update", _get_active_score_phrases(k))
+    return jsonify([success, message])

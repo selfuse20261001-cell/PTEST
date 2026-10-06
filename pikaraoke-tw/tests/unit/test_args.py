@@ -1,0 +1,129 @@
+"""Unit tests for args module."""
+
+import pytest
+
+from pikaraoke.lib.args import arg_path_parse, parse_pikaraoke_args, parse_volume
+
+
+class TestArgPathParse:
+    """Tests for the arg_path_parse function."""
+
+    def test_string_passthrough(self):
+        """Test that a string path is returned unchanged."""
+        result = arg_path_parse("/home/user/songs")
+        assert result == "/home/user/songs"
+
+    def test_list_joined_with_spaces(self):
+        """Test that a list of paths is joined with spaces."""
+        result = arg_path_parse(["/home/user/my", "songs", "folder"])
+        assert result == "/home/user/my songs folder"
+
+    def test_none_returns_none(self):
+        """Test that None input returns None."""
+        result = arg_path_parse(None)
+        assert result is None
+
+    def test_single_item_list(self):
+        """Test that a single-item list returns just the item."""
+        result = arg_path_parse(["/home/user/songs"])
+        assert result == "/home/user/songs"
+
+    def test_empty_list(self):
+        """Test that an empty list returns empty string."""
+        result = arg_path_parse([])
+        assert result == ""
+
+
+class TestParseVolume:
+    """Tests for the parse_volume function."""
+
+    def test_valid_volume_string(self):
+        """Test parsing a valid volume string."""
+        result = parse_volume("0.5", "test volume")
+        assert result == 0.5
+
+    def test_valid_volume_float(self):
+        """Test parsing a valid volume float."""
+        result = parse_volume(0.75, "test volume")
+        assert result == 0.75
+
+    def test_volume_zero(self):
+        """Test that zero volume is valid."""
+        result = parse_volume("0", "test volume")
+        assert result == 0.0
+
+    def test_volume_one(self):
+        """Test that volume of 1 is valid."""
+        result = parse_volume("1", "test volume")
+        assert result == 1.0
+
+    def test_volume_above_one_resets_to_default(self, capsys):
+        """Test that volume above 1 resets to default."""
+        result = parse_volume("1.5", "test volume")
+        assert result == 0.85  # default_volume
+        captured = capsys.readouterr()
+        assert "ERROR" in captured.out
+
+    def test_volume_negative_resets_to_default(self, capsys):
+        """Test that negative volume resets to default."""
+        result = parse_volume("-0.5", "test volume")
+        assert result == 0.85  # default_volume
+        captured = capsys.readouterr()
+        assert "ERROR" in captured.out
+
+    def test_volume_decimal_precision(self):
+        """Test that decimal precision is preserved."""
+        result = parse_volume("0.333", "test volume")
+        assert result == 0.333
+
+
+class TestParsePikaraokeArgs:
+    """Tests for parse_pikaraoke_args."""
+
+    def test_skip_youtubedl_upgrade_default(self, monkeypatch):
+        monkeypatch.setattr("sys.argv", ["pikaraoke"])
+        args = parse_pikaraoke_args()
+        assert args.skip_youtubedl_upgrade is False
+
+    def test_skip_youtubedl_upgrade_flag(self, monkeypatch):
+        monkeypatch.setattr("sys.argv", ["pikaraoke", "--skip-youtubedl-upgrade"])
+        args = parse_pikaraoke_args()
+        assert args.skip_youtubedl_upgrade is True
+
+    def test_skip_ytdl_upgrade_alias(self, monkeypatch):
+        monkeypatch.setattr("sys.argv", ["pikaraoke", "--skip-ytdl-upgrade"])
+        args = parse_pikaraoke_args()
+        assert args.skip_youtubedl_upgrade is True
+
+    def test_omitting_admin_password_keeps_the_stored_one(self, monkeypatch):
+        monkeypatch.setattr("sys.argv", ["pikaraoke"])
+        args = parse_pikaraoke_args()
+        assert args.admin_password is None
+
+    def test_admin_password_with_no_value_clears_it(self, monkeypatch):
+        """A bare flag, because not every shell can pass an empty string."""
+        monkeypatch.setattr("sys.argv", ["pikaraoke", "--admin-password"])
+        args = parse_pikaraoke_args()
+        assert args.admin_password == ""
+
+    def test_admin_password_sets_it(self, monkeypatch):
+        monkeypatch.setattr("sys.argv", ["pikaraoke", "--admin-password", "hunter2"])
+        args = parse_pikaraoke_args()
+        assert args.admin_password == "hunter2"
+
+    def test_a_background_video_path_that_does_not_exist_is_dropped(self, monkeypatch, tmp_path):
+        """The message always claimed this; nothing used to reassign the path."""
+        monkeypatch.setattr("sys.argv", ["pikaraoke", "--bg-video-path", str(tmp_path / "nope")])
+        args = parse_pikaraoke_args()
+        assert args.bg_video_path is None
+
+    @pytest.mark.parametrize("names_a_directory", [True, False])
+    def test_a_background_video_path_that_exists_survives(
+        self, monkeypatch, tmp_path, names_a_directory
+    ):
+        video = tmp_path / "clip.mp4"
+        video.write_bytes(b"video")
+        path = tmp_path if names_a_directory else video
+        monkeypatch.setattr("sys.argv", ["pikaraoke", "--bg-video-path", str(path)])
+        args = parse_pikaraoke_args()
+        assert args.bg_video_path == str(path)

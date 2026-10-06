@@ -1,0 +1,640 @@
+{% extends 'base.html' %} {% block scripts %}
+<script src="https://cdn.jsdelivr.net/npm/sortablejs@latest/Sortable.min.js"></script>
+
+<script>
+  // Pass admin status from server to JavaScript
+  var isAdmin = JSON.parse('{{ admin | tojson }}');
+
+  // Escape strings for safe use in HTML attributes
+  function escape(str) {
+    return encodeURIComponent(str);
+  }
+
+  // Ensure global socket exists
+  if (typeof window.socket === 'undefined') {
+    window.socket = io({ path: window.pikaraokeConfig.socketioPath });
+  }
+
+  // Initialize queue state if needed
+  if (typeof window.queuePageState === 'undefined') {
+    window.queuePageState = {
+      queue: [],
+      previousQueue: null,
+      nowPlaying: null,
+      previousNowPlaying: null
+    };
+  }
+
+  // Define global queue functions
+  window.queuePage_getQueue = function() {
+    if ($('#auto-refresh').length === 0) {
+      return;
+    }
+
+    // Fetch both queue and now_playing data
+    $.when(
+      $.get('{{ url_for("queue_api.get_queue") }}'),
+      $.get('{{ url_for("now_playing.now_playing") }}')
+    ).done(function(queueResp, nowPlayingResp) {
+      var newQueue = queueResp[0];
+      var newNowPlaying = nowPlayingResp[0] || null;
+
+      var queueChanged = !isEqual(newQueue, window.queuePageState.previousQueue);
+      var npChanged = !isEqual(newNowPlaying, window.queuePageState.previousNowPlaying);
+
+      if (queueChanged || npChanged) {
+        window.queuePageState.queue = newQueue;
+        window.queuePageState.nowPlaying = newNowPlaying;
+
+        // Destroy existing Sortable before replacing HTML to avoid errors
+        var table = document.getElementById('auto-refresh');
+        if (table && table.sortableInstance) {
+            table.sortableInstance.destroy();
+            table.sortableInstance = null;
+        }
+
+        $("#auto-refresh").html(window.queuePage_generateHTML());
+        window.queuePageState.previousQueue = newQueue;
+        window.queuePageState.previousNowPlaying = newNowPlaying;
+
+        // Initialize Drag and Drop after HTML is rendered
+        window.initSortable();
+
+        // Highlight moved row if tracked
+        if (window.highlightAfterRefresh) {
+          var fileToHighlight = window.highlightAfterRefresh;
+          window.highlightAfterRefresh = null;
+          $('a.queue-song-options-btn').each(function() {
+            if (decodeURIComponent($(this).data('file')) === fileToHighlight) {
+              $(this).closest('tr').addClass('row-moved');
+            }
+          });
+        }
+      }
+    });
+  };
+
+  window.initSortable = function() {
+    var table = document.getElementById('auto-refresh');
+    var tbody = table ? table.querySelector('tbody') : null;
+
+    // Only init if admin (drag handles exist)
+    if ($(".drag-handle").length > 0 && tbody) {
+       table.sortableInstance = Sortable.create(tbody, {
+          handle: '.drag-handle',
+          animation: 150,
+          filter: '.disabled-sort',
+          chosenClass: 'drag-chosen',
+          // Touch device settings for better iOS compatibility
+          delay: 100,
+          delayOnTouchOnly: true,
+          touchStartThreshold: 5,
+          onMove: function (evt) {
+             // Prevent moving an item to the now-playing position
+             return evt.related.className.indexOf('disabled-sort') === -1;
+          },
+          onEnd: function (evt) {
+             if (evt.oldIndex === evt.newIndex) return;
+
+             // Calculate offset: if now-playing row exists, DOM indices are offset by 1
+             var np = window.queuePageState.nowPlaying;
+             var offset = (np && np.now_playing) ? 1 : 0;
+
+             // Convert DOM indices to queue array indices
+             var oldQueueIndex = evt.oldIndex - offset;
+             var newQueueIndex = evt.newIndex - offset;
+
+             // Track file for highlight after refresh
+             var movedFile = $(evt.item).find('.queue-song-options-btn').data('file');
+             if (movedFile) {
+                 window.highlightAfterRefresh = decodeURIComponent(movedFile);
+             }
+
+             // Immediately update row numbers to reflect new positions
+             $('#auto-refresh tbody tr:not(.disabled-sort)').each(function(i) {
+                 $(this).find('td:first').text(i + 1);
+             });
+
+             // Send queue indices to backend
+             $.post("{{ url_for('queue_api.reorder') }}", {
+                 old_index: oldQueueIndex,
+                 new_index: newQueueIndex
+             }).done(function() {
+                 // Force refresh to update data attributes
+                 window.queuePageState.previousQueue = null;
+                 window.queuePage_getQueue();
+             });
+          }
+      });
+    }
+  };
+
+  // Column width constants
+  var COL_WIDTH = {
+    number: '35px',
+    drag: '44px',
+    options: '50px'
+  };
+
+  // Generate now-playing row HTML
+  function generateNowPlayingRow(np) {
+    var iconSrc = np.is_paused
+      ? '{{ url_for("static", filename="images/now-playing.png") }}'
+      : '{{ url_for("static", filename="images/now-playing.gif") }}';
+
+    var html = '<tr class="disabled-sort has-background-dark">';
+    html += '<td style="width: ' + COL_WIDTH.number + '; padding: 8px 8px; vertical-align: middle; text-align: center;">';
+    html += '<img src="' + iconSrc + '" alt="Now Playing" style="width: 35px; height: auto;">';
+    html += '</td>';
+
+    if (isAdmin) {
+      html += '<td style="width: ' + COL_WIDTH.drag + '; padding: 5px 0px; vertical-align: middle;"></td>';
+    }
+
+    html += '<td style="padding: 8px 10px; vertical-align: middle;">';
+    html += '<div class="is-flex is-flex-wrap-wrap is-align-items-baseline">';
+    html += '<span class="has-text-success">' + np.now_playing_user + '</span>';
+    html += '<span class="is-hidden-mobile has-text-grey mx-2">&bull;</span>';
+    html += '<span class="has-text-weight-bold has-text-success is-hidden-mobile">' + np.now_playing + '</span>';
+    html += '<span class="is-size-7 has-text-weight-bold has-text-success is-hidden-tablet" style="width: 100%;">' + np.now_playing + '</span>';
+    html += '</div></td>';
+
+    if (isAdmin) {
+      html += '<td style="width: ' + COL_WIDTH.options + '; vertical-align: middle; text-align: right;">';
+      html += '<a class="has-text-grey-light row-options-btn now-playing-options-btn" title="{{ _("Options") | forceescape }}">';
+      html += '<i class="icon-cog is-size-5"></i></a>';
+      html += '</td>';
+    }
+    html += '</tr>';
+    return html;
+  }
+
+
+  // yt-dlp's status is the machine state; these are what a person reads. Only the
+  // phases that report a number carry one: the merge holds a full bar with no
+  // percentage of its own, and printing "100%" beside it read as a hang.
+  var DOWNLOAD_PHASES = {
+      // {# MSG: Download phase shown while yt-dlp resolves the video, before any bytes arrive. #}
+      'starting': { label: {{ _('Preparing') | tojson }} },
+      // {# MSG: Download phase shown while a failed download waits to start again. The attempt tag says it is a retry. #}
+      'retrying': { label: {{ _('Preparing') | tojson }} },
+      // {# MSG: Download phase shown while the video stream is transferring. #}
+      'downloading': { label: {{ _('Downloading video') | tojson }}, percent: true, rate: true },
+      // {# MSG: Download phase shown while the separate audio stream is transferring. #}
+      'downloading audio': { label: {{ _('Downloading audio') | tojson }}, percent: true, rate: true },
+      // {# MSG: Download phase shown while ffmpeg combines the downloaded video and audio. #}
+      'merging': { label: {{ _('Merging') | tojson }} },
+      // {# MSG: Download phase shown once the download has finished. #}
+      'complete': { label: {{ _('Complete') | tojson }}, percent: true }
+  };
+  // {# MSG: Tag on the active download showing which attempt is running, e.g. "Retrying 2/5". #}
+  var RETRYING_LABEL = {{ _('Retrying') | tojson }};
+
+  // Download progress polling. The bar draws a reported percentage and nothing else;
+  // the phases yt-dlp cannot number animate in place instead of advancing.
+  window.queuePage_renderActiveDownload = function(status) {
+      var host = document.getElementById('downloads-active');
+      var d = status.active;
+      if (!d) {
+          host.innerHTML = '';
+          host.removeAttribute('data-url');
+          return;
+      }
+
+      if (host.getAttribute('data-url') !== d.url) {
+          host.setAttribute('data-url', d.url);
+          host.innerHTML = `
+              <div class="box mb-4 has-background-dark">
+                  <h4 class="title is-5 mb-2 dl-title"></h4>
+                  <div class="dl-bar"><div class="dl-bar-fill"></div></div>
+                  <div class="dl-meta is-size-7">
+                      <span class="dl-phase-group">
+                          <span class="dl-phase"></span>
+                          <span class="tag is-info is-light is-rounded dl-attempt is-hidden"></span>
+                      </span>
+                      <span class="dl-percent"></span>
+                      <span class="dl-meta-rate">
+                          <span class="dl-speed"></span>
+                          <span>{{ _('ETA') | forceescape }}&nbsp;<span class="dl-eta"></span></span>
+                      </span>
+                  </div>
+              </div>`;
+          host.querySelector('.dl-title').textContent = d.title;
+          // Flush the 0% start, or the first width lands with nothing to transition from.
+          void host.querySelector('.dl-bar-fill').offsetWidth;
+      }
+
+      // An unknown status still shows everything rather than blanking the readout.
+      var phase = DOWNLOAD_PHASES[d.status] || { label: d.status, percent: true, rate: true };
+
+      // The byte count survives a silence; the rate does not. A stalled download keeps
+      // its fill and its percentage and gives up the speed and the ETA.
+      var waiting = d.stalled || d.status === 'merging';
+
+      var fill = host.querySelector('.dl-bar-fill');
+      fill.style.width = d.progress + '%';
+      fill.classList.toggle('is-waiting', waiting);
+      host.querySelector('.dl-bar').classList
+          .toggle('is-waiting', d.status === 'starting' || d.status === 'retrying');
+
+      host.querySelector('.dl-phase').textContent = phase.label;
+
+      var attempt = host.querySelector('.dl-attempt');
+      attempt.classList.toggle('is-hidden', !d.attempts);
+      attempt.textContent = `${RETRYING_LABEL} ${d.attempts + 1}/${status.max_attempts}`;
+
+      var percent = host.querySelector('.dl-percent');
+      percent.classList.toggle('is-hidden', !phase.percent);
+      percent.textContent = Math.round(d.progress) + '%';
+
+      host.querySelector('.dl-meta-rate').classList.toggle('is-hidden', !phase.rate || waiting);
+      host.querySelector('.dl-speed').textContent = d.speed;
+      host.querySelector('.dl-eta').textContent = d.eta;
+  };
+
+  window.queuePage_getDownloads = function() {
+      // Clean up existing timer if any
+      if (window.downloadPollTimer) {
+          clearTimeout(window.downloadPollTimer);
+      }
+
+      // Stop if we left the page
+      if ($('#downloads-section').length === 0) {
+          return;
+      }
+
+      $.get('{{ url_for("queue_api.get_current_downloads") }}', function(status) {
+          var html = "";
+
+          if (status.pending && status.pending.length > 0) {
+              html += `<div class="content"><h5 class="title is-6 mb-2">{{ _('Pending downloads') | forceescape }}</h5>`;
+              status.pending.forEach(function(d) {
+                  // A re-queued download has to be distinguishable from a fresh one
+                  var tag = d.attempts > 0
+                      ? `<span class="tag is-info is-light is-rounded ml-auto">{{ _('Retrying') | forceescape }}&nbsp;${d.attempts + 1}/${status.max_attempts}</span>`
+                      : `<span class="tag is-light is-rounded ml-auto">{{ _('Queued') | forceescape }}</span>`;
+                  html += `
+                      <div class="box mb-2 p-3 has-background-dark is-flex is-align-items-center">
+                          <span class="has-text-grey">${d.display_title || d.video_url}</span>
+                          ${tag}
+                      </div>
+                  `;
+              });
+              html += `</div>`;
+          }
+
+          if (status.errors && status.errors.length > 0) {
+              html += `<div class="content"><h5 class="title is-6 mb-2 has-text-danger">{{ _('Download Errors') | forceescape }}</h5>`;
+              status.errors.forEach(function(d) {
+                  html += `
+                      <div class="box mb-2 p-3 has-background-white-ter is-flex is-align-items-center" style="border-left: 4px solid #f14668;">
+                          <span class="icon has-text-danger mr-2"><i class="icon-cancel"></i></span>
+                          <div class="is-flex-grow-1" style="min-width: 0;">
+                              <p class="has-text-grey mb-0 is-truncated" title="${d.title || d.url}">${d.title || d.url}</p>
+                              <p class="help is-danger mb-0 is-truncated" title="${d.error}">${d.error}</p>
+                          </div>
+                          <span class="tag is-danger is-light is-rounded ml-2">{{ _('Failed') | forceescape }}</span>
+                          <button class="button is-small is-info is-light ml-2" onclick="retryDownloadError('${d.id}')">{{ _('Retry') | forceescape }}</button>
+                          <button class="delete ml-2" onclick="dismissDownloadError('${d.id}')" title="{{ _('Dismiss') | forceescape }}"></button>
+                      </div>
+                  `;
+              });
+              html += `</div>`;
+          }
+
+          // Show the section first: a card built inside display:none has no layout,
+          // so its fill would land at full width with nothing to transition from.
+          if (status.active || html) {
+              $("#downloads-section").fadeIn();
+          } else {
+              $("#downloads-section").fadeOut();
+          }
+          window.queuePage_renderActiveDownload(status);
+          $("#downloads-rest").html(html);
+
+          // Continue polling only if there are active items or pending downloads
+          // Error items don't need constant polling
+          var shouldPoll = status.active || (status.pending && status.pending.length > 0);
+
+          if (shouldPoll && $('#downloads-section').length > 0) {
+              window.downloadPollTimer = setTimeout(window.queuePage_getDownloads, 500);
+          }
+      });
+  };
+
+  window.retryDownloadError = function(errorId) {
+      $.post('{{ url_for("queue_api.retry_download_error", error_id="ERROR_ID") }}'.replace("ERROR_ID", errorId), function() {
+          // Polling is stopped while only errors are on screen, so restart it here
+          window.queuePage_getDownloads();
+      });
+  };
+
+  window.dismissDownloadError = function(errorId) {
+      $.ajax({
+          url: '{{ url_for("queue_api.delete_download_error", error_id="ERROR_ID") }}'.replace("ERROR_ID", errorId),
+          type: 'DELETE',
+          success: function(result) {
+              // Refresh immediately since polling might be stopped
+              window.queuePage_getDownloads();
+          }
+      });
+  };
+
+   // Socket listeners for download activity
+  window.socket.off("download_started");
+  window.socket.on("download_started", function() {
+      // Start polling if not already running
+      if (!window.downloadPollTimer) {
+          window.queuePage_getDownloads();
+      }
+  });
+
+  window.socket.off("download_stopped");
+  window.socket.on("download_stopped", function() {
+       // Do one final fetch to show completion/errors then stop
+       // The getDownloads function handles stopping if nothing is active
+       if (window.downloadPollTimer) {
+           clearTimeout(window.downloadPollTimer);
+           window.downloadPollTimer = null;
+       }
+       window.queuePage_getDownloads();
+  });
+
+
+  // Generate queue row HTML
+  function generateQueueRow(e, index) {
+    var html = '<tr data-index="' + index + '">';
+    html += '<td style="width: ' + COL_WIDTH.number + '; padding: 8px 8px; vertical-align: middle; text-align: center;">' + (index + 1) + '</td>';
+
+    if (isAdmin) {
+      html += '<td class="drag-handle" style="width: ' + COL_WIDTH.drag + '; vertical-align: middle; text-align: center; cursor: grab; touch-action: none;" title="{{ _("Drag to reorder") | forceescape }}">';
+      html += '<i class="icon icon-braille has-text-grey-light"></i>';
+      html += '</td>';
+    }
+
+    html += '<td style="padding: 8px 10px; vertical-align: middle;">';
+    html += '<div class="is-flex is-flex-wrap-wrap is-align-items-baseline">';
+    html += '<span class="has-text-success">' + e.user + '</span>';
+    html += '<span class="is-hidden-mobile has-text-grey mx-2">&bull;</span>';
+    html += '<span class="has-text-weight-bold is-hidden-mobile">' + e.title + '</span>';
+    html += '<span class="is-size-7 has-text-weight-bold is-hidden-tablet" style="width: 100%;">' + e.title + '</span>';
+    html += '</div></td>';
+
+    if (isAdmin) {
+      html += '<td style="width: ' + COL_WIDTH.options + '; vertical-align: middle; text-align: right; padding-right: 10px;">';
+      html += '<a class="has-text-grey-light row-options-btn queue-song-options-btn" data-index="' + index + '" data-file="' + escape(e.file) + '" data-title="' + escape(e.title) + '" title="{{ _("Options") | forceescape }}">';
+      html += '<i class="icon-cog is-size-5"></i></a>';
+      html += '</td>';
+    }
+
+    html += '</tr>';
+    return html;
+  }
+
+  window.queuePage_generateHTML = function() {
+    var html = "<tbody>";
+    var queue = window.queuePageState.queue;
+    var np = window.queuePageState.nowPlaying;
+    var colSpan = isAdmin ? 4 : 2;
+
+    if (np && np.now_playing) {
+      html += generateNowPlayingRow(np);
+    }
+
+    if (queue.length > 0) {
+      queue.forEach(function(e, index) {
+        html += generateQueueRow(e, index);
+      });
+    } else if (!np || !np.now_playing) {
+      // Only show empty message if nothing is playing AND queue is empty
+      html += '<tr><td colspan="' + colSpan + '"><p class="has-text-warning">{{ _("The queue is empty") | forceescape }}</p></td></tr>';
+    }
+
+    html += "</tbody>";
+    return html;
+  };
+
+  // Store current song info for modal actions
+  window.currentSongOptions = {
+      index: -1,
+      file: '',
+      title: ''
+  };
+
+  // Track file to highlight after queue refresh
+  window.highlightAfterRefresh = null;
+
+  // Execute queue edit action via AJAX
+  window.executeQueueAction = function(action) {
+      var file = window.currentSongOptions.file;
+      var url = window.pikaraokeConfig.basePath + "/api/queue/edit?song=" + encodeURIComponent(file) + "&action=" + action;
+
+      // Track moved file for highlight (except delete)
+      if (action !== 'delete') {
+          window.highlightAfterRefresh = file;
+      }
+
+      $.post(url).done(function(result) {
+          if (!result.success) {
+              console.error('Queue action failed:', action);
+          }
+          // Socket event will trigger queue refresh
+      }).fail(function() {
+          console.error('Queue action request failed');
+          window.highlightAfterRefresh = null;
+      });
+
+      window.closeSongOptions();
+  };
+
+  // Open the modal menu
+  window.openSongOptions = function(index, file, title) {
+      // Store song info for AJAX actions
+      window.currentSongOptions = {
+          index: index,
+          file: file,
+          title: title
+      };
+
+      $('#modal-song-title').text(title);
+
+      var basePath = window.pikaraokeConfig.basePath;
+      $('#opt-rename').attr('href', basePath + '/files/edit?song=' + encodeURIComponent(file)
+          + '&referrer=' + encodeURIComponent(basePath + '/queue'));
+
+      // Reset all options to visible first
+      $('#opt-up, #opt-top, #opt-down, #opt-bottom').show();
+
+      // Hide "Up"/"Play Next" if first in queue (index 0)
+      if (index === 0) {
+          $('#opt-up, #opt-top').hide();
+      }
+      // Hide "Down"/"Bottom" if last in queue
+      var queueLen = window.queuePageState.queue.length;
+      if (index >= queueLen - 1) {
+          $('#opt-down, #opt-bottom').hide();
+      }
+
+      $('#song-options-modal').addClass('is-active');
+  }
+
+  window.closeSongOptions = function() {
+      $('#song-options-modal').removeClass('is-active');
+  }
+
+  // Socket listeners setup (same as before)
+  // Socket listeners - refresh on queue or now_playing changes
+  window.socket.off("queue_update");
+  window.socket.on("queue_update", window.queuePage_getQueue);
+  window.socket.off("now_playing");
+  window.socket.on("now_playing", window.queuePage_getQueue);
+  window.queuePageState.previousQueue = null;
+  window.queuePageState.previousNowPlaying = null;
+
+  // Open now-playing options modal
+  window.openNowPlayingOptions = function() {
+      var np = window.queuePageState.nowPlaying;
+      if (!np || !np.now_playing) return;
+
+      $('#np-modal-song-title').text(np.now_playing);
+
+      // Update play/pause button based on current state
+      if (np.is_paused) {
+          $('#np-pause-btn').html('<span class="icon mr-2"><i class="icon-play"></i></span>{% trans %}Play{% endtrans %}');
+      } else {
+          $('#np-pause-btn').html('<span class="icon mr-2"><i class="icon-pause"></i></span>{% trans %}Pause{% endtrans %}');
+      }
+
+      $('#now-playing-options-modal').addClass('is-active');
+  };
+
+  window.closeNowPlayingOptions = function() {
+      $('#now-playing-options-modal').removeClass('is-active');
+  };
+
+  // Execute playback action and close modal
+  window.executePlaybackAction = function(action) {
+      $.post(window.pikaraokeConfig.basePath + '/api/' + action);
+      window.closeNowPlayingOptions();
+  };
+
+  // Initialize
+  $(function() {
+    window.queuePage_getDownloads();
+    window.queuePage_getQueue();
+
+      // Close modals on background click
+      $('.modal-background').click(function() {
+          window.closeSongOptions();
+          window.closeNowPlayingOptions();
+      });
+
+      // Queue song options button (for queued songs)
+      $(document).on('click', '.queue-song-options-btn', function(e) {
+          e.preventDefault();
+          var $btn = $(this);
+          var index = parseInt($btn.data('index'), 10);
+          var file = decodeURIComponent($btn.data('file'));
+          var title = decodeURIComponent($btn.data('title'));
+          openSongOptions(index, file, title);
+      });
+
+      // Now-playing options button
+      $(document).on('click', '.now-playing-options-btn', function(e) {
+          e.preventDefault();
+          openNowPlayingOptions();
+      });
+  });
+
+  // Visibility handler (same as before)
+  // ... (Keep existing visibility logic here if needed) ...
+</script>
+
+{% endblock %}
+
+{% block content %}
+
+<table class="table is-striped" id="auto-refresh" style="margin-bottom: 30px">
+</table>
+
+{% if admin %}
+<div class="is-flex is-justify-content-space-between is-align-items-center mb-3">
+	<div class="is-flex is-align-items-center">
+		<a class="add-random has-text-success" href="#"
+			><i class="icon icon-plus-circled is-size-5 mr-1"></i></a>
+			{% trans %}Add <input id="randomNumberInput" class="input mx-2 p-2" pattern="\d*" maxlength="2" value="3" min="1" max="99" style="width: 42px" /> random songs{% endtrans %}
+	</div>
+	<div>
+		<a class="button is-danger is-outlined confirm-clear" href="{{ request.script_root }}/api/queue/edit?action=clear">
+		<i class="icon icon-trash-empty mr-1"></i>{% trans %}Clear all{% endtrans %}</a>
+	</div>
+</div>
+
+<div class="modal" id="song-options-modal">
+  <div class="modal-background"></div>
+  <div class="modal-card" style="width: 90%; max-width: 400px;">
+    <header class="modal-card-head" style="padding: 15px;">
+      <p class="modal-card-title is-size-6" id="modal-song-title" style="max-width: 95%">Song Options</p>
+      <button class="delete" aria-label="close" onclick="closeSongOptions()"></button>
+    </header>
+    <section class="modal-card-body" style="padding: 0;">
+        <a id="opt-top" class="panel-block py-3" href="#" onclick="executeQueueAction('top'); return false;">
+            <span class="icon has-text-info mr-2"><i class="icon-angle-double-up"></i></span>
+            <b>{% trans %}Play Next{% endtrans %}</b>&nbsp;({% trans %}Move to Top{% endtrans %})
+        </a>
+        <a id="opt-up" class="panel-block py-3" href="#" onclick="executeQueueAction('up'); return false;">
+            <span class="icon mr-2"><i class="icon-angle-up"></i></span>
+            {% trans %}Move Up{% endtrans %}
+        </a>
+        <a id="opt-down" class="panel-block py-3" href="#" onclick="executeQueueAction('down'); return false;">
+            <span class="icon mr-2"><i class="icon-angle-down"></i></span>
+            {% trans %}Move Down{% endtrans %}
+        </a>
+        <a id="opt-bottom" class="panel-block py-3" href="#" onclick="executeQueueAction('bottom'); return false;">
+            <span class="icon has-text-info mr-2"><i class="icon-angle-double-down"></i></span>
+            {% trans %}Move to Bottom{% endtrans %}
+        </a>
+        <a id="opt-rename" class="panel-block py-3 edit-button" href="#">
+            <span class="icon mr-2"><i class="icon-edit-1"></i></span>
+            {% trans %}Rename{% endtrans %}
+        </a>
+        <a id="opt-delete" class="panel-block py-3 has-text-danger" href="#" onclick="executeQueueAction('delete'); return false;">
+            <span class="icon mr-2"><i class="icon-trash-empty"></i></span>
+            {% trans %}Remove from Queue{% endtrans %}
+        </a>
+    </section>
+  </div>
+</div>
+
+<div class="modal" id="now-playing-options-modal">
+  <div class="modal-background"></div>
+  <div class="modal-card" style="width: 90%; max-width: 400px;">
+    <header class="modal-card-head" style="padding: 15px;">
+      <p class="modal-card-title is-size-6" id="np-modal-song-title" style="max-width: 95%">Now Playing</p>
+      <button class="delete" aria-label="close" onclick="closeNowPlayingOptions()"></button>
+    </header>
+    <section class="modal-card-body" style="padding: 0;">
+        <a class="panel-block py-3" href="#" onclick="executePlaybackAction('restart'); return false;">
+            <span class="icon mr-2"><i class="icon-to-start"></i></span>
+            {% trans %}Restart{% endtrans %}
+        </a>
+        <a id="np-pause-btn" class="panel-block py-3" href="#" onclick="executePlaybackAction('pause'); return false;">
+            <span class="icon mr-2"><i class="icon-pause"></i></span>
+            {% trans %}Pause{% endtrans %}
+        </a>
+        <a class="panel-block py-3 has-text-danger" href="#" onclick="executePlaybackAction('skip'); return false;">
+            <span class="icon mr-2"><i class="icon-to-end"></i></span>
+            {% trans %}Skip{% endtrans %}
+        </a>
+    </section>
+  </div>
+</div>
+{% endif %}
+
+<div id="downloads-section" style="display:none; margin-top: 30px; border-top: 1px solid var(--dark-border); padding-top: 20px;">
+    <h3 class="title is-4">{{ _('Download queue') }}</h3>
+    <div id="downloads-active"></div>
+    <div id="downloads-rest"></div>
+</div>
+
+{% endblock %}

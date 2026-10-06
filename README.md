@@ -1,5 +1,7 @@
 # 家用 KTV：電視播放 + 手機點歌
 
+> 另一個選擇：[`pikaraoke-tw/`](pikaraoke-tw/docs/README.zh-TW.md) 是以 PiKaraoke 為基礎的台灣中文歌版（Python），會把歌下載到本機播放，不受 YouTube「不允許嵌入」限制，也不需要 API 金鑰。
+
 ## 架構
 - **伺服器**（家裡任一台電腦 / NAS / TV 盒 Termux）：管理點歌佇列、搜尋 YouTube
 - **電視**：瀏覽器開 `tv.html`，全螢幕播放 YouTube KTV 影片

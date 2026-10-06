@@ -1,0 +1,168 @@
+name: CI
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+  push:
+    branches:
+    - master
+
+env:
+  PYTHON_VERSION: '3.10'
+
+jobs:
+  code-quality:
+    runs-on: ubuntu-latest
+    env:
+      SKIP: no-commit-to-branch  # skips commit to main check
+      PRE_COMMIT_CONFIG: code_quality/.pre-commit-config.yaml
+      VENV: venv
+      VENV_ACTIVATE: venv/bin/activate
+
+    steps:
+    - name: Check out code
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      with:
+        token: ${{ github.token }}
+
+    - name: Cache pre-commit dependencies
+      uses: actions/cache@v6
+      id: cache
+      with:
+        path: ~/.cache/pre-commit
+        key: ${{ runner.os }}-pre-commit-${{ hashFiles(env.PRE_COMMIT_CONFIG) }}
+        restore-keys: |
+          ${{ runner.os }}-pre-commit-
+
+    - name: Install uv
+      # The pylint hook runs from the project environment, so uv must resolve it.
+      # setup-uv stopped publishing moving major tags at v8, so pin the exact version.
+      uses: astral-sh/setup-uv@v9.0.0
+
+    - name: Install Requirements
+      run: python3 -m pip install docstr-coverage==2.3.2 pre-commit==3.7.1
+
+    - name: Code Quality
+      run: |
+        pre-commit run --config ${{ env.PRE_COMMIT_CONFIG }} --all-files
+
+    - name: Docstring Coverage
+      run: |
+        mkdir -p docs/badges/ docstr
+        docstr-coverage --config code_quality/.docstr.yaml pikaraoke/ 2>&1 | tee docstr/docstring_coverage.txt
+
+  commitlint:
+    runs-on: ubuntu-latest
+    name: Commitlint
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v7
+      with:
+        fetch-depth: 0  # Required to get all commits for linting
+    - name: Run commitlint
+      uses: wagoid/commitlint-github-action@v6
+
+  smoketest:
+    runs-on: ${{ matrix.os }}
+    name: Smoke Test
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+      fail-fast: false
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v7
+
+    - name: Preload ffmpeg (MacOS)
+      if: runner.os == 'macOS'
+      run: brew install ffmpeg # override ffmpeg-full install for mac because it adds minutes to the test job
+
+    - name: Install, launch and verify Pikaraoke (Unix)
+      if: runner.os != 'Windows'
+      run: ./build_scripts/ci/smoketest.sh
+
+    - name: Install, launch and verify Pikaraoke (Windows)
+      if: runner.os == 'Windows'
+      shell: powershell
+      run: ./build_scripts/ci/smoketest.ps1
+
+  unit-tests:
+    runs-on: ubuntu-latest
+    name: Unit Tests
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v7
+
+    - name: Install uv
+      # setup-uv stopped publishing moving major tags at v8, so pin the exact version.
+      uses: astral-sh/setup-uv@v9.0.0
+
+    - name: Run tests
+      run: uv run pytest tests/ -v --cov=pikaraoke --cov-report=term-missing --cov-report=xml:coverage.xml
+
+  docker-smoketest:
+    runs-on: ubuntu-latest
+    name: Docker Build Smoketest (amd64)
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v7
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v4
+
+    - name: Build and Load for Smoketest (amd64)
+      uses: docker/build-push-action@v7
+      with:
+        context: .
+        file: build_scripts/docker/Dockerfile
+        push: false
+        load: true
+        tags: pikaraoke-ci-test-amd64:latest
+        cache-from: type=gha,scope=docker-build
+        cache-to: type=gha,mode=max,scope=docker-build
+
+    - name: Verify Runtime (amd64)
+      run: |
+        ./build_scripts/ci/docker-smoketest.sh pikaraoke-ci-test-amd64:latest pikaraoke-test-amd64
+
+
+  docker-smoketest-arm64:
+    runs-on: ubuntu-22.04-arm
+    name: Docker Build Smoketest (arm64)
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v7
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v4
+
+    - name: Build and Load for Smoketest (arm64)
+      uses: docker/build-push-action@v7
+      with:
+        context: .
+        file: build_scripts/docker/Dockerfile
+        platforms: linux/arm64
+        push: false
+        load: true
+        tags: pikaraoke-ci-test-arm64:latest
+        cache-from: type=gha,scope=docker-build-arm64
+        cache-to: type=gha,mode=max,scope=docker-build-arm64
+
+    - name: Verify Runtime (arm64)
+      run: |
+        ./build_scripts/ci/docker-smoketest.sh pikaraoke-ci-test-arm64:latest pikaraoke-test-arm64
+
+  # Compiles the installer without publishing it, so a broken .iss surfaces here
+  # rather than during the release that would have attached it.
+  installer-build:
+    runs-on: windows-latest
+    name: Windows Installer Build
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v7
+
+    - name: Install Inno Setup
+      run: choco install innosetup -y --no-progress
+
+    - name: Build Windows installer
+      run: .\build_scripts\install\build_installer.ps1
