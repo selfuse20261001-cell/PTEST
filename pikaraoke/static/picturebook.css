@@ -458,3 +458,79 @@ table {
 .tag.is-light {
   color: var(--pb-ink);
 }
+
+/* Dark Bulma helpers used in the templates: keep them light so ink text stays readable. */
+.has-background-dark,
+.has-background-black-bis,
+.has-background-grey-dark {
+  background-color: var(--pb-yamabuki-pale) !important;
+  color: var(--pb-ink) !important;
+}
+.has-background-white-ter {
+  background-color: var(--pb-paper) !important;
+  color: var(--pb-ink) !important;
+}
+.has-text-white,
+.has-text-grey,
+.has-text-grey-light {
+  color: var(--pb-ink) !important;
+}
+.has-text-grey,
+.has-text-grey-light {
+  color: var(--pb-ink-soft) !important;
+}
+
+/* Disabled coloured buttons would otherwise keep Bulma's faded text. */
+.button[disabled],
+.button.is-primary[disabled],
+.button.is-link[disabled],
+.button.is-info[disabled],
+.button.is-success[disabled],
+.button.is-warning[disabled],
+.button.is-danger[disabled] {
+  color: var(--pb-ink-soft);
+  background-color: var(--pb-paper);
+  border-color: var(--pb-ink);
+  border-style: dashed;
+  opacity: 1;
+}
+
+/* Batch renamer turns table rows into cards on phones with its own dark fill. */
+html .songs-table tr {
+  background: var(--pb-yamabuki-pale);
+  border: var(--pb-line-mid);
+  border-radius: var(--pb-radius-sm);
+}
+
+/* Native checkboxes were 13px: big enough to tap, coloured to match. */
+input[type="checkbox"],
+input[type="radio"] {
+  width: 20px;
+  height: 20px;
+  accent-color: var(--pb-ink);
+}
+
+/* Row menu button was 20px; widen the hit area without moving the glyph. */
+.row-options-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 36px;
+  min-height: 36px;
+}
+
+/* Files page letter strip floats over the list on phones: outline it like a card. */
+#alpha-bar {
+  border: var(--pb-line-mid);
+  border-radius: var(--pb-radius-sm);
+}
+
+/* Now-playing row: its animated icon is yellow, so give it a cool ground. */
+tr.disabled-sort.has-background-dark {
+  background-color: var(--pb-mizu-pale) !important;
+}
+/* One weight across the system; hierarchy comes from size and colour. */
+.has-text-weight-bold,
+.has-text-weight-semibold {
+  font-weight: 400 !important;
+}
