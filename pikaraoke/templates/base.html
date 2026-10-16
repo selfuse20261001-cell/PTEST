@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html data-theme="dark">
+<html data-theme="{{ 'dark' if blank_page else 'light' }}">
 
 <head>
   {% if title %}
@@ -15,6 +15,9 @@
   <link rel="stylesheet" href="{{  url_for('static', filename='bulma.min.css') }}">
   <link rel="stylesheet" href="{{  url_for('static', filename='bulma-dark.css') }}">
   <link rel="stylesheet" href="{{  url_for('static', filename='custom.css') }}">
+  {% if not blank_page %}
+  <link rel="stylesheet" href="{{  url_for('static', filename='picturebook.css') }}">
+  {% endif %}
   <link rel="icon" type="image/png" href="{{  url_for('static', filename='images/microphone.png') }}">
   <link rel="stylesheet" href="{{  url_for('static', filename='fontello/css/fontello.css') }}?v=2">
 

@@ -1,0 +1,460 @@
+/* Picture-book travel design system ("繪本旅行") applied to the phone UI.
+   Loaded after bulma-dark.css by base.html on every page except the chromeless TV
+   splash. Remapping the --dark-* variables restyles everything bulma-dark.css
+   colours; the rules below add the system's structure (ink outlines, large radii,
+   one round typeface, a single lift shadow). Tokens: paper, ink, ink-soft, four
+   accents and their pale tints, all dark text on light fills. */
+
+@import url("https://fonts.googleapis.com/css2?family=Huninn&display=swap");
+
+:root {
+  --pb-paper: #fffcf6;
+  --pb-ink: #3e3a39;
+  --pb-ink-soft: #645e5c;
+  --pb-coral: #f2a497;
+  --pb-yamabuki: #f6d27a;
+  --pb-mizu: #a8d3e6;
+  --pb-wakatake: #b9daa5;
+  --pb-coral-pale: #fbe3de;
+  --pb-yamabuki-pale: #fcf1d3;
+  --pb-mizu-pale: #e3f1f7;
+  --pb-wakatake-pale: #e7f2e0;
+  --pb-line-bold: 3px solid var(--pb-ink);
+  --pb-line-mid: 2px solid var(--pb-ink);
+  --pb-radius-xs: 8px;
+  --pb-radius-sm: 14px;
+  --pb-radius-md: 18px;
+  --pb-radius-lg: 22px;
+  --pb-lift: 0 4px 0 var(--pb-ink);
+  --pb-font: "Huninn", "jf-openhuninn", "PingFang TC", "Noto Sans TC", "Microsoft JhengHei",
+    sans-serif;
+
+  /* bulma-dark.css reads these; point them at the light palette. */
+  --dark-bg-primary: var(--pb-paper);
+  --dark-bg-secondary: var(--pb-yamabuki-pale);
+  --dark-bg-tertiary: var(--pb-mizu-pale);
+  --dark-text-primary: var(--pb-ink);
+  --dark-text-secondary: var(--pb-ink);
+  --dark-text-muted: var(--pb-ink-soft);
+  --dark-text-light: var(--pb-ink);
+  --dark-border: var(--pb-ink);
+  --dark-border-light: var(--pb-ink);
+  --dark-primary: var(--pb-coral);
+  --dark-link: var(--pb-ink);
+  --dark-link-hover: var(--pb-ink);
+  --dark-info: var(--pb-mizu);
+  --dark-success: var(--pb-wakatake);
+  --dark-warning: var(--pb-yamabuki);
+  --dark-danger: var(--pb-coral);
+  color-scheme: light;
+}
+
+html,
+body {
+  background-color: var(--pb-paper);
+  color: var(--pb-ink);
+  font-family: var(--pb-font);
+  font-weight: 400;
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6,
+.title,
+.subtitle {
+  font-family: var(--pb-font);
+  font-weight: 400;
+  text-wrap: balance;
+}
+.content h2,
+.content h3,
+.content h4,
+.content h5,
+.content h6,
+strong,
+b {
+  font-weight: 400;
+}
+
+a {
+  text-decoration: underline dotted 2px;
+  text-underline-offset: 3px;
+}
+a:hover {
+  background-color: var(--pb-yamabuki-pale);
+}
+
+code,
+pre {
+  background-color: var(--pb-yamabuki-pale);
+  color: var(--pb-ink);
+  border: var(--pb-line-mid);
+  border-radius: var(--pb-radius-xs);
+}
+
+/* Focus ring: visible on every fill. */
+a:focus-visible,
+button:focus-visible,
+.button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  outline: 3px dashed var(--pb-ink);
+  outline-offset: 3px;
+  box-shadow: none;
+}
+
+/* base.html declares these inline after the stylesheets, so match with extra specificity. */
+html tr:nth-child(even) {
+  background-color: var(--pb-yamabuki-pale);
+}
+.table,
+.table td,
+.table th,
+.table thead th {
+  color: var(--pb-ink);
+  background-color: transparent;
+  border-color: var(--pb-ink);
+}
+.table.is-striped tbody tr:not(.is-selected):nth-child(even),
+.table.is-hoverable tbody tr:not(.is-selected):hover {
+  background-color: var(--pb-yamabuki-pale);
+}
+
+/* Objects: every card-like surface is paper with a bold ink outline. */
+.box,
+.card,
+.message,
+.panel,
+.modal-card,
+.dropdown-content,
+.navbar-dropdown {
+  background-color: var(--pb-paper);
+  color: var(--pb-ink);
+  border: var(--pb-line-bold);
+  border-radius: var(--pb-radius-lg);
+  box-shadow: none;
+}
+.card-header,
+.card-footer,
+.card-footer-item,
+.modal-card-head,
+.modal-card-foot,
+.panel-heading,
+.message-header {
+  background-color: transparent;
+  color: var(--pb-ink);
+  border-color: var(--pb-ink);
+}
+.modal-card-body,
+.message-body,
+.panel-block {
+  background-color: transparent;
+  color: var(--pb-ink);
+  border-color: var(--pb-ink);
+}
+.modal-background {
+  background-color: rgba(62, 58, 57, 0.55);
+}
+
+/* Navbar: paper with a bold underline, pill-shaped links. */
+.navbar {
+  background-color: var(--pb-paper);
+  border-bottom: var(--pb-line-bold);
+}
+.navbar-item,
+.navbar-link,
+.navbar-burger {
+  color: var(--pb-ink);
+  border-radius: 999px;
+}
+.navbar-item:hover,
+.navbar-item.is-active,
+.navbar-link:hover,
+.navbar-dropdown a.navbar-item:hover,
+.navbar-dropdown a.navbar-item.is-active {
+  background-color: var(--pb-yamabuki-pale);
+  color: var(--pb-ink);
+}
+.navbar-menu {
+  background-color: var(--pb-paper);
+}
+.navbar-divider,
+.dropdown-divider {
+  background-color: var(--pb-ink);
+}
+
+/* Buttons: outlined, flat fill, hover tints to yamabuki-pale. */
+.button {
+  font-family: var(--pb-font);
+  font-weight: 400;
+  color: var(--pb-ink);
+  background-color: var(--pb-paper);
+  border: var(--pb-line-bold);
+  border-radius: var(--pb-radius-md);
+  box-shadow: none;
+}
+.button:hover,
+.button:focus,
+.button:active,
+.button.is-active {
+  background-color: var(--pb-yamabuki-pale);
+  border-color: var(--pb-ink);
+  color: var(--pb-ink);
+  box-shadow: none;
+}
+.button.is-primary,
+.button.is-danger {
+  background-color: var(--pb-coral);
+}
+.button.is-link,
+.button.is-info {
+  background-color: var(--pb-mizu);
+}
+.button.is-success {
+  background-color: var(--pb-wakatake);
+}
+.button.is-warning {
+  background-color: var(--pb-yamabuki);
+}
+.button.is-primary:hover,
+.button.is-link:hover,
+.button.is-info:hover,
+.button.is-success:hover,
+.button.is-warning:hover,
+.button.is-danger:hover {
+  background-color: var(--pb-yamabuki-pale);
+  color: var(--pb-ink);
+}
+.button[disabled],
+.button.is-primary[disabled] {
+  background-color: var(--pb-paper);
+  color: var(--pb-ink-soft);
+  border-style: dashed;
+  opacity: 1;
+}
+
+/* Fields */
+.input,
+.textarea,
+.select select {
+  font-family: var(--pb-font);
+  color: var(--pb-ink);
+  background-color: var(--pb-paper);
+  border: var(--pb-line-bold);
+  border-radius: var(--pb-radius-md);
+  box-shadow: none;
+}
+.input:hover,
+.textarea:hover,
+.select select:hover {
+  background-color: var(--pb-yamabuki-pale);
+  border-color: var(--pb-ink);
+}
+.input:focus,
+.input.is-focused,
+.textarea:focus,
+.select select:focus {
+  background-color: var(--pb-paper);
+  border-color: var(--pb-ink);
+  box-shadow: none;
+}
+.input::placeholder,
+.textarea::placeholder {
+  color: var(--pb-ink-soft);
+}
+.label,
+.checkbox,
+.radio {
+  color: var(--pb-ink);
+  font-weight: 400;
+}
+.select:not(.is-multiple):not(.is-loading)::after {
+  border-color: var(--pb-ink);
+}
+
+/* Tags and notifications: flat tint, ink outline, dark text. */
+.tag:not(body) {
+  font-family: var(--pb-font);
+  background-color: var(--pb-paper);
+  color: var(--pb-ink);
+  border: var(--pb-line-mid);
+  border-radius: 999px;
+}
+.tag.is-primary,
+.tag.is-danger {
+  background-color: var(--pb-coral);
+}
+.tag.is-link,
+.tag.is-info {
+  background-color: var(--pb-mizu);
+}
+.tag.is-success {
+  background-color: var(--pb-wakatake);
+}
+.tag.is-warning {
+  background-color: var(--pb-yamabuki);
+}
+.notification {
+  color: var(--pb-ink);
+  background-color: var(--pb-yamabuki-pale);
+  border: var(--pb-line-mid);
+  border-radius: var(--pb-radius-sm);
+}
+.notification.is-primary,
+.notification.is-danger {
+  background-color: var(--pb-coral-pale);
+}
+.notification.is-link,
+.notification.is-info {
+  background-color: var(--pb-mizu-pale);
+}
+.notification.is-success {
+  background-color: var(--pb-wakatake-pale);
+}
+
+/* Tabs and pagination: the selected one lifts and takes yamabuki. */
+.tabs a,
+.pagination-previous,
+.pagination-next,
+.pagination-link {
+  color: var(--pb-ink);
+  background-color: var(--pb-paper);
+  border: var(--pb-line-bold);
+  border-radius: var(--pb-radius-md);
+}
+.tabs a:hover,
+.pagination-previous:hover,
+.pagination-next:hover,
+.pagination-link:hover {
+  background-color: var(--pb-yamabuki-pale);
+  border-color: var(--pb-ink);
+  color: var(--pb-ink);
+}
+.tabs li.is-active a,
+.tabs.is-boxed li.is-active a,
+.tabs.is-toggle li.is-active a,
+.pagination-link.is-current {
+  background-color: var(--pb-yamabuki);
+  border-color: var(--pb-ink);
+  color: var(--pb-ink);
+  transform: translateY(-2px);
+  box-shadow: var(--pb-lift);
+}
+.tabs ul {
+  border-bottom-color: var(--pb-ink);
+}
+.pagination-page-info b {
+  color: var(--pb-ink);
+}
+
+.menu-list a,
+.menu-label,
+.dropdown-item,
+.panel-tabs a,
+.breadcrumb a {
+  color: var(--pb-ink);
+}
+.menu-list a:hover,
+.menu-list a.is-active,
+.dropdown-item:hover,
+.dropdown-item.is-active,
+.panel-block:hover {
+  background-color: var(--pb-yamabuki-pale);
+  color: var(--pb-ink);
+}
+
+.control-box a {
+  color: var(--pb-ink);
+}
+.control-box a:hover {
+  color: var(--pb-ink);
+  background-color: var(--pb-yamabuki-pale);
+}
+
+hr {
+  background-color: transparent;
+  border-top: 2px dashed var(--pb-ink);
+  height: 0;
+}
+
+/* Download progress: wakatake fill inside an outlined pill. */
+.dl-bar {
+  background-color: var(--pb-paper);
+  border: var(--pb-line-bold);
+  border-radius: 999px;
+}
+.dl-bar-fill {
+  background-color: var(--pb-wakatake);
+  border-right: var(--pb-line-bold);
+}
+
+html .session-ribbon {
+  background-color: var(--pb-yamabuki-pale);
+  border: var(--pb-line-mid);
+  color: var(--pb-ink);
+  text-transform: none;
+  letter-spacing: 0.04em;
+  font-weight: 400;
+}
+html .session-ribbon-dot {
+  background-color: var(--pb-wakatake);
+  border: 2px solid var(--pb-ink);
+}
+
+/* Numerals line up in times, counts and progress. */
+.when,
+.pagination-page-info,
+.dl-meta,
+.dl-percent,
+table {
+  font-variant-numeric: tabular-nums;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation: none !important;
+    transition: none !important;
+  }
+}
+
+/* Status colours: Bulma's coloured text helpers would put yellow or green on paper. */
+.has-text-warning,
+.has-text-success,
+.has-text-danger,
+.has-text-info,
+.has-text-primary,
+.has-text-link {
+  color: var(--pb-ink) !important;
+}
+
+/* Controls and icon links carry their own outline; no link underline on top. */
+.navbar-item,
+.navbar-link,
+.button,
+.tabs a,
+.pagination-link,
+.pagination-previous,
+.pagination-next,
+.menu-list a,
+.dropdown-item,
+.panel-block {
+  text-decoration: none;
+}
+
+/* Outlined and light variants: Bulma colours their text (pink on paper fails contrast). */
+.button.is-outlined,
+.button.is-light {
+  color: var(--pb-ink);
+  border-color: var(--pb-ink);
+}
+.button.is-danger.is-outlined,
+.button.is-danger.is-light {
+  background-color: var(--pb-coral-pale);
+}
+.tag.is-light {
+  color: var(--pb-ink);
+}
