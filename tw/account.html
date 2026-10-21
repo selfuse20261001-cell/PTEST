@@ -1,5 +1,5 @@
 <!doctype html><html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow,noarchive"><title>台股模擬帳戶</title><style>
-:root{--bg:#f6f7f5;--fg:#1d2422;--mute:#5f6b67;--line:#dfe3e0;--up:#c8322b;--dn:#15803d}
+:root{color-scheme:light dark;--bg:#f6f7f5;--fg:#1d2422;--mute:#5f6b67;--line:#dfe3e0;--up:#c8322b;--dn:#15803d}
 @media (prefers-color-scheme:dark){:root{--bg:#141816;--fg:#e6ebe8;--mute:#9aa5a1;--line:#2e3532;--up:#f06a5f;--dn:#4ade80}}
 body{background:var(--bg);color:var(--fg);font:16px/1.6 -apple-system,"Noto Sans TC","PingFang TC",sans-serif;margin:0}
 main{max-width:760px;margin:0 auto;padding:24px 16px 48px}
@@ -11,10 +11,10 @@ td{padding:6px 8px 6px 0;border-bottom:1px solid var(--line);white-space:nowrap;
 .up{color:var(--up)}.dn{color:var(--dn)}.key{display:flex;flex-wrap:wrap;gap:4px 14px;font-size:13px}
 .key b{display:inline-block;width:12px;height:3px;vertical-align:middle;margin-right:4px}
 svg text{fill:var(--mute);font-size:13px}svg{color:var(--fg);touch-action:none}
-.pick{font:inherit;font-size:16px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg);width:100%;max-width:360px;margin:8px 0}
+.pick{appearance:none;-webkit-appearance:none;background-image:linear-gradient(45deg,transparent 50%,currentColor 50%),linear-gradient(135deg,currentColor 50%,transparent 50%)!important;background-position:calc(100% - 18px) 55%,calc(100% - 12px) 55%;background-size:6px 6px;background-repeat:no-repeat;font:inherit;font-size:16px;padding:8px 32px 8px 10px;border:1px solid var(--line);border-radius:8px;background-color:var(--bg);color:var(--fg);width:100%;max-width:360px;margin:8px 0}
 .tip{position:absolute;top:0;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:6px 8px;font-size:13px;white-space:pre;pointer-events:none}
 #sum tr:hover{background:var(--line)}
-</style></head><body><main><h1>台股 150 萬模擬帳戶｜10/21</h1><p class="sub">每個策略各自一個 150 萬帳戶，從 10/08 開始。用下拉選單選策略，圖、總資產、持股都只顯示該策略（虛線是全買大盤對照）；手指在圖上滑動可看每天數值。</p><select id="pick" class="pick" aria-label="選擇策略"></select><div style="position:relative"><svg id="chart" viewBox="0 0 640 260" width="100%" role="img" aria-label="各策略淨值走勢"></svg><div id="tip" class="tip" hidden></div></div><h2>總資產</h2><div class="tw"><table id="sum"><tr><th>策略</th><th>總資產</th><th>報酬</th></tr></table></div><h2>持股 <span id="posnote" class="sub"></span></h2><div class="tw"><table id="pos"><tr><th>策略</th><th>股票</th><th>股數</th><th>均價</th><th>報酬</th></tr></table></div><script>
+</style></head><body><main><h1>台股 150 萬模擬帳戶｜10/21</h1><p class="sub">每個策略各自一個 150 萬帳戶，從 10/08 開始。用下拉選單選策略，圖、總資產、持股都只顯示該策略（虛線是全買大盤對照）；手指在圖上滑動可看每天數值。</p><select id="pick" class="pick" aria-label="選擇策略"></select><div style="position:relative"><svg id="chart" viewBox="0 0 640 260" width="100%" role="img" aria-label="各策略淨值走勢"></svg><div id="tip" class="tip" hidden></div></div><h2>總資產</h2><div class="tw"><table id="sum"><tr><th>策略</th><th>總資產</th><th>報酬</th><th>對大盤</th><th>最大回撤</th></tr></table></div><h2>持股 <span id="posnote" class="sub"></span></h2><div class="tw"><table id="pos"><tr><th>策略</th><th>股票</th><th>股數</th><th>均價</th><th>報酬</th></tr></table></div><script>
 const COLORS = ["#c8322b", "#0f5e5a", "#b26b00", "#4f6bd8", "#8a2a24", "#15803d", "#7a4fd8", "#5f6b67"], START = 1500000;
 const fmt = v => Math.round(v).toLocaleString(), pc = x => (x > 0 ? "+" : "") + (x * 100).toFixed(2) + "%";
 const cls = x => x > 0 ? "up" : x < 0 ? "dn" : "";
@@ -42,12 +42,18 @@ Promise.all(["eq.csv", "pos.csv"].map(f => fetch(f).then(r => r.text()))).then((
     const shown = picked ? [picked, ...bench.filter(n => n !== picked)] : names;
     const vs = shown.flatMap(n => Object.values(val[n]));
     if (!vs.length) return;
-    const lo = Math.min(...vs), hi = Math.max(...vs);
-    const x = i => P + i * (W - 2 * P) / Math.max(dates.length - 1, 1);
+    const lo = Math.min(...vs, START), hi = Math.max(...vs, START);
+    const L = 58, x = i => L + i * (W - L - P) / Math.max(dates.length - 1, 1);
     const y = v => H - P - (v - lo) / ((hi - lo) || 1) * (H - 2 * P);
-    svg.append(el("line", {x1: P, x2: W - P, y1: y(START), y2: y(START), stroke: "currentColor", "stroke-opacity": .25, "stroke-dasharray": "3 3"}));
-    svg.append(el("text", {x: P, y: 12}, fmt(hi)), el("text", {x: P, y: H - 8}, fmt(lo)));
-    svg.append(el("text", {x: W - P, y: H - 8, "text-anchor": "end"}, dates.at(-1)));
+    svg.append(el("line", {x1: L, x2: W - P, y1: y(START), y2: y(START), stroke: "currentColor", "stroke-opacity": .25, "stroke-dasharray": "3 3"}));
+    const step = [5e3, 1e4, 2e4, 5e4, 1e5].find(st => (hi - lo) / st <= 5) || 2e5;
+    for (let t = Math.ceil(lo / step) * step; t <= hi; t += step) {
+      svg.append(el("line", {x1: L, x2: W - P, y1: y(t), y2: y(t), stroke: "currentColor", "stroke-opacity": .08}));
+      svg.append(el("text", {x: L - 6, y: y(t) + 4, "text-anchor": "end"}, (t / 1e4).toFixed(0) + "萬"));
+    }
+    svg.append(el("line", {x1: L, x2: L, y1: P, y2: H - P, stroke: "currentColor", "stroke-opacity": .3}));
+    const ticks = [0, Math.floor((dates.length - 1) / 2), dates.length - 1];
+    ticks.forEach((i, k) => svg.append(el("text", {x: x(i), y: H - 10, "text-anchor": ["start", "middle", "end"][k]}, dates[i].slice(5).replace("-", "/"))));
     shown.forEach(n => {
       const pts = dates.map((d, i) => val[n][d] === undefined ? null : x(i).toFixed(1) + "," + y(val[n][d]).toFixed(1)).filter(Boolean);
       svg.append(el("polyline", {points: pts.join(" "), fill: "none", stroke: COLORS[names.indexOf(n) % COLORS.length],
@@ -57,7 +63,7 @@ Promise.all(["eq.csv", "pos.csv"].map(f => fetch(f).then(r => r.text()))).then((
     svg.append(guide);
     svg.onpointermove = ev => {
       const r = svg.getBoundingClientRect(), px = (ev.clientX - r.left) / r.width * W;
-      const i = Math.max(0, Math.min(dates.length - 1, Math.round((px - P) / ((W - 2 * P) / Math.max(dates.length - 1, 1)))));
+      const i = Math.max(0, Math.min(dates.length - 1, Math.round((px - L) / ((W - L - P) / Math.max(dates.length - 1, 1)))));
       guide.setAttribute("x1", x(i)); guide.setAttribute("x2", x(i)); guide.setAttribute("stroke-opacity", .4);
       tip.replaceChildren(el("div", {}, dates[i]));
       shown.map(n => [n, val[n][dates[i]]]).filter(([, v]) => v !== undefined).sort((a, b) => b[1] - a[1])
@@ -69,10 +75,15 @@ Promise.all(["eq.csv", "pos.csv"].map(f => fetch(f).then(r => r.text()))).then((
   }
   function tables() {
     sumT.querySelectorAll("tr:not(:first-child)").forEach(r => r.remove());
-    names.filter(n => !picked || n === picked || n.startsWith("全買")).map(n => [n, val[n][Object.keys(val[n]).sort().at(-1)]]).sort((a, b) => b[1] - a[1]).forEach(([n, v]) => {
+    const last = n => val[n][Object.keys(val[n]).sort().at(-1)];
+    const bench = names.find(n => n.startsWith("全買")), bRet = bench ? last(bench) / START - 1 : 0;
+    const dd = n => { let peak = -Infinity, m = 0; Object.keys(val[n]).sort().forEach(d => { peak = Math.max(peak, val[n][d]); m = Math.min(m, val[n][d] / peak - 1); }); return m; };
+    names.filter(n => !picked || n === picked || n === bench).map(n => [n, last(n)]).sort((a, b) => b[1] - a[1]).forEach(([n, v]) => {
       const tr = sumT.insertRow(); tr.style.cursor = "pointer"; if (picked === n) tr.style.fontWeight = 700;
       tr.insertCell().textContent = n; tr.insertCell().textContent = fmt(v);
       const c = tr.insertCell(); c.textContent = pc(v / START - 1); c.className = cls(v - START);
+      const r = v / START - 1 - bRet, cb = tr.insertCell(); cb.textContent = n === bench ? "—" : pc(r); cb.className = n === bench ? "" : cls(r);
+      tr.insertCell().textContent = pc(dd(n));
       tr.onclick = () => { sel.value = picked === n ? "" : n; sel.onchange(); };
     });
     posT2.querySelectorAll("tr:not(:first-child)").forEach(r => r.remove());
