@@ -19,7 +19,7 @@ const COLORS = ["#c8322b", "#0f5e5a", "#b26b00", "#4f6bd8", "#8a2a24", "#15803d"
 const fmt = v => Math.round(v).toLocaleString(), pc = x => (x > 0 ? "+" : "") + (x * 100).toFixed(2) + "%";
 const cls = x => x > 0 ? "up" : x < 0 ? "dn" : "";
 function parse(t) {
-  const [head, ...lines] = t.trim().split("\n");
+  const [head, ...lines] = t.trim().split(/\r?\n/);
   const cols = head.split(",");
   return lines.map(l => Object.fromEntries(l.split(",").map((v, i) => [cols[i], v])));
 }
