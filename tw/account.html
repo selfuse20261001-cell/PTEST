@@ -14,7 +14,7 @@ svg text{fill:var(--mute);font-size:13px}svg{color:var(--fg);touch-action:none}
 .pick{font:inherit;font-size:16px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg);width:100%;max-width:360px;margin:8px 0}
 .tip{position:absolute;top:0;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:6px 8px;font-size:13px;white-space:pre;pointer-events:none}
 #sum tr:hover{background:var(--line)}
-</style></head><body><main><h1>台股 150 萬模擬帳戶｜10/21</h1><p class="sub">每個策略各自一個 150 萬帳戶，從 10/08 開始。選策略會在圖上標出它，並只列它的持股；手指在圖上滑動可看每天數值。</p><select id="pick" class="pick" aria-label="選擇策略"></select><div style="position:relative"><svg id="chart" viewBox="0 0 640 260" width="100%" role="img" aria-label="各策略淨值走勢"></svg><div id="tip" class="tip" hidden></div></div><h2>總資產</h2><div class="tw"><table id="sum"><tr><th>策略</th><th>總資產</th><th>報酬</th></tr></table></div><h2>持股 <span id="posnote" class="sub"></span></h2><div class="tw"><table id="pos"><tr><th>策略</th><th>股票</th><th>股數</th><th>均價</th><th>報酬</th></tr></table></div><script>
+</style></head><body><main><h1>台股 150 萬模擬帳戶｜10/21</h1><p class="sub">每個策略各自一個 150 萬帳戶，從 10/08 開始。用下拉選單選策略，圖、總資產、持股都只顯示該策略（虛線是全買大盤對照）；手指在圖上滑動可看每天數值。</p><select id="pick" class="pick" aria-label="選擇策略"></select><div style="position:relative"><svg id="chart" viewBox="0 0 640 260" width="100%" role="img" aria-label="各策略淨值走勢"></svg><div id="tip" class="tip" hidden></div></div><h2>總資產</h2><div class="tw"><table id="sum"><tr><th>策略</th><th>總資產</th><th>報酬</th></tr></table></div><h2>持股 <span id="posnote" class="sub"></span></h2><div class="tw"><table id="pos"><tr><th>策略</th><th>股票</th><th>股數</th><th>均價</th><th>報酬</th></tr></table></div><script>
 const COLORS = ["#c8322b", "#0f5e5a", "#b26b00", "#4f6bd8", "#8a2a24", "#15803d", "#7a4fd8", "#5f6b67"], START = 1500000;
 const fmt = v => Math.round(v).toLocaleString(), pc = x => (x > 0 ? "+" : "") + (x * 100).toFixed(2) + "%";
 const cls = x => x > 0 ? "up" : x < 0 ? "dn" : "";
@@ -38,7 +38,8 @@ Promise.all(["eq.csv", "pos.csv"].map(f => fetch(f).then(r => r.text()))).then((
   const sel = document.getElementById("pick"), sumT = document.getElementById("sum"), posT2 = document.getElementById("pos");
   function draw() {
     svg.replaceChildren();
-    const W = 640, H = 260, P = 34, shown = names;
+    const W = 640, H = 260, P = 34, bench = names.filter(n => n.startsWith("全買"));
+    const shown = picked ? [picked, ...bench.filter(n => n !== picked)] : names;
     const vs = shown.flatMap(n => Object.values(val[n]));
     if (!vs.length) return;
     const lo = Math.min(...vs), hi = Math.max(...vs);
@@ -50,7 +51,7 @@ Promise.all(["eq.csv", "pos.csv"].map(f => fetch(f).then(r => r.text()))).then((
     shown.forEach(n => {
       const pts = dates.map((d, i) => val[n][d] === undefined ? null : x(i).toFixed(1) + "," + y(val[n][d]).toFixed(1)).filter(Boolean);
       svg.append(el("polyline", {points: pts.join(" "), fill: "none", stroke: COLORS[names.indexOf(n) % COLORS.length],
-        "stroke-width": picked === n ? 3 : 1.6, "stroke-opacity": picked && picked !== n ? .3 : 1}));
+        "stroke-width": picked === n ? 3 : 1.6, "stroke-dasharray": picked && picked !== n ? "5 4" : ""}));
     });
     const guide = el("line", {y1: P, y2: H - P, stroke: "currentColor", "stroke-opacity": 0});
     svg.append(guide);
@@ -68,7 +69,7 @@ Promise.all(["eq.csv", "pos.csv"].map(f => fetch(f).then(r => r.text()))).then((
   }
   function tables() {
     sumT.querySelectorAll("tr:not(:first-child)").forEach(r => r.remove());
-    names.map(n => [n, val[n][Object.keys(val[n]).sort().at(-1)]]).sort((a, b) => b[1] - a[1]).forEach(([n, v]) => {
+    names.filter(n => !picked || n === picked || n.startsWith("全買")).map(n => [n, val[n][Object.keys(val[n]).sort().at(-1)]]).sort((a, b) => b[1] - a[1]).forEach(([n, v]) => {
       const tr = sumT.insertRow(); tr.style.cursor = "pointer"; if (picked === n) tr.style.fontWeight = 700;
       tr.insertCell().textContent = n; tr.insertCell().textContent = fmt(v);
       const c = tr.insertCell(); c.textContent = pc(v / START - 1); c.className = cls(v - START);
