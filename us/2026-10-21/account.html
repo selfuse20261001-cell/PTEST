@@ -1,20 +1,20 @@
 <!doctype html><html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow,noarchive"><title>美股模擬帳戶</title><style>
 :root{--bg:#f6f7f5;--fg:#1d2422;--mute:#5f6b67;--line:#dfe3e0;--up:#c8322b;--dn:#15803d}
 @media (prefers-color-scheme:dark){:root{--bg:#141816;--fg:#e6ebe8;--mute:#9aa5a1;--line:#2e3532;--up:#f06a5f;--dn:#4ade80}}
-body{background:var(--bg);color:var(--fg);font:15px/1.6 -apple-system,"Noto Sans TC","PingFang TC",sans-serif;margin:0}
+body{background:var(--bg);color:var(--fg);font:16px/1.6 -apple-system,"Noto Sans TC","PingFang TC",sans-serif;margin:0}
 main{max-width:760px;margin:0 auto;padding:24px 16px 48px}
 h1{font-size:22px;margin:0 0 4px}h2{font-size:17px;margin:28px 0 8px}a{color:inherit}
 .sub{color:var(--mute);font-size:13px}.tw{overflow-x:auto}
-table{border-collapse:collapse;width:100%;font-size:14px}
-th{text-align:left;color:var(--mute);font-weight:400;font-size:12px;border-bottom:2px solid var(--line);padding:4px 8px 4px 0}
+table{border-collapse:collapse;width:100%;font-size:15px}
+th{text-align:left;color:var(--mute);font-weight:400;font-size:13px;border-bottom:2px solid var(--line);padding:4px 8px 4px 0}
 td{padding:6px 8px 6px 0;border-bottom:1px solid var(--line);white-space:nowrap;font-variant-numeric:tabular-nums}
 .up{color:var(--up)}.dn{color:var(--dn)}.key{display:flex;flex-wrap:wrap;gap:4px 14px;font-size:13px}
 .key b{display:inline-block;width:12px;height:3px;vertical-align:middle;margin-right:4px}
-svg text{fill:var(--mute);font-size:10px}svg{color:var(--fg);touch-action:none}
-.chip{display:inline-block;border:2px solid;border-radius:99px;padding:0 10px;font-size:13px;cursor:pointer;user-select:none}.chip.off{opacity:.35}
-.tip{position:absolute;top:0;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:6px 8px;font-size:12px;white-space:pre;pointer-events:none}
+svg text{fill:var(--mute);font-size:13px}svg{color:var(--fg);touch-action:none}
+.pick{font:inherit;font-size:16px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg);width:100%;max-width:360px;margin:8px 0}
+.tip{position:absolute;top:0;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:6px 8px;font-size:13px;white-space:pre;pointer-events:none}
 #sum tr:hover{background:var(--line)}
-</style></head><body><main><h1>美股 150 萬模擬帳戶｜10/21</h1><p class="sub">每個策略各自一個 150 萬帳戶，從 10/08 開始。點下方標籤可隱藏／顯示該策略。</p><div id="key" class="key"></div><div style="position:relative"><svg id="chart" viewBox="0 0 640 240" width="100%" role="img" aria-label="各策略淨值走勢"></svg><div id="tip" class="tip" hidden></div></div><h2>總資產</h2><div class="tw"><table id="sum"><tr><th>策略</th><th>總資產</th><th>報酬</th></tr></table></div><h2>持股 <span id="posnote" class="sub"></span></h2><div class="tw"><table id="pos"><tr><th>策略</th><th>股票</th><th>股數</th><th>均價</th><th>報酬</th></tr></table></div><script>
+</style></head><body><main><h1>美股 150 萬模擬帳戶｜10/21</h1><p class="sub">每個策略各自一個 150 萬帳戶，從 10/08 開始。選策略會在圖上標出它，並只列它的持股；手指在圖上滑動可看每天數值。</p><select id="pick" class="pick" aria-label="選擇策略"></select><div style="position:relative"><svg id="chart" viewBox="0 0 640 260" width="100%" role="img" aria-label="各策略淨值走勢"></svg><div id="tip" class="tip" hidden></div></div><h2>總資產</h2><div class="tw"><table id="sum"><tr><th>策略</th><th>總資產</th><th>報酬</th></tr></table></div><h2>持股 <span id="posnote" class="sub"></span></h2><div class="tw"><table id="pos"><tr><th>策略</th><th>股票</th><th>股數</th><th>均價</th><th>報酬</th></tr></table></div><script>
 const COLORS = ["#c8322b", "#0f5e5a", "#b26b00", "#4f6bd8", "#8a2a24", "#15803d", "#7a4fd8", "#5f6b67"], START = 1500000;
 const fmt = v => Math.round(v).toLocaleString(), pc = x => (x > 0 ? "+" : "") + (x * 100).toFixed(2) + "%";
 const cls = x => x > 0 ? "up" : x < 0 ? "dn" : "";
@@ -33,12 +33,12 @@ Promise.all(["eq.csv", "pos.csv"].map(f => fetch(f).then(r => r.text()))).then((
   const eq = parse(eqT), pos = parse(posT);
   const names = [...new Set(eq.map(r => r.strategy))], dates = [...new Set(eq.map(r => r.date))].sort();
   const val = {}; eq.forEach(r => (val[r.strategy] ??= {})[r.date] = +r.value);
-  const on = new Set(names); let picked = null;
+  let picked = null;
   const svg = document.getElementById("chart"), tip = document.getElementById("tip");
-  const keyBox = document.getElementById("key"), sumT = document.getElementById("sum"), posT2 = document.getElementById("pos");
+  const sel = document.getElementById("pick"), sumT = document.getElementById("sum"), posT2 = document.getElementById("pos");
   function draw() {
     svg.replaceChildren();
-    const W = 640, H = 240, P = 28, shown = names.filter(n => on.has(n));
+    const W = 640, H = 260, P = 34, shown = names;
     const vs = shown.flatMap(n => Object.values(val[n]));
     if (!vs.length) return;
     const lo = Math.min(...vs), hi = Math.max(...vs);
@@ -72,21 +72,20 @@ Promise.all(["eq.csv", "pos.csv"].map(f => fetch(f).then(r => r.text()))).then((
       const tr = sumT.insertRow(); tr.style.cursor = "pointer"; if (picked === n) tr.style.fontWeight = 700;
       tr.insertCell().textContent = n; tr.insertCell().textContent = fmt(v);
       const c = tr.insertCell(); c.textContent = pc(v / START - 1); c.className = cls(v - START);
-      tr.onclick = () => { picked = picked === n ? null : n; draw(); tables(); };
+      tr.onclick = () => { sel.value = picked === n ? "" : n; sel.onchange(); };
     });
     posT2.querySelectorAll("tr:not(:first-child)").forEach(r => r.remove());
-    pos.filter(r => !picked || r.strategy === picked).forEach(r => {
+    const ret = r => r.ret === "" ? -Infinity : +r.ret;
+    pos.filter(r => !picked || r.strategy === picked).sort((a, b) => ret(b) - ret(a)).forEach(r => {
       const tr = posT2.insertRow();
       [r.strategy, r.stock, (+r.shares).toLocaleString(), r.avg_cost].forEach(t => tr.insertCell().textContent = t);
       const c = tr.insertCell(); if (r.ret) { c.textContent = pc(+r.ret); c.className = cls(+r.ret); }
     });
-    document.getElementById("posnote").textContent = picked ? "（" + picked + "，再點一次看全部）" : "（點上表的策略只看該策略）";
+    document.getElementById("posnote").textContent = "（" + (picked || "全部策略") + "，損益高到低）";
   }
-  names.forEach((n, i) => {
-    const b = el("div"); b.className = "chip"; b.style.borderColor = COLORS[i % COLORS.length]; b.textContent = n;
-    b.onclick = () => { on.has(n) ? on.delete(n) : on.add(n); b.classList.toggle("off"); draw(); };
-    keyBox.append(b);
-  });
+  sel.append(new Option("全部策略", ""));
+  names.forEach(n => sel.append(new Option(n, n)));
+  sel.onchange = () => { picked = sel.value || null; draw(); tables(); };
   draw(); tables();
-}).catch(e => { document.getElementById("key").textContent = "資料讀取失敗：" + e; });
+}).catch(e => { document.getElementById("posnote").textContent = "資料讀取失敗：" + e; });
 </script><p class="sub">僅供研究，非投資建議。<a href="https://selfuse20261001-cell.github.io/PTEST/">回首頁</a></p></main></body></html>
