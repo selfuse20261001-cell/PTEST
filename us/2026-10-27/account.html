@@ -1,0 +1,116 @@
+<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow,noarchive"><title>美股模擬帳戶</title><style>
+:root{color-scheme:light dark;--bg:#f6f7f5;--fg:#1d2422;--mute:#5f6b67;--line:#dfe3e0;--up:#c8322b;--dn:#15803d}
+@media (prefers-color-scheme:dark){:root{--bg:#141816;--fg:#e6ebe8;--mute:#9aa5a1;--line:#2e3532;--up:#f06a5f;--dn:#4ade80}}
+body{background:var(--bg);color:var(--fg);font:16px/1.6 -apple-system,"Noto Sans TC","PingFang TC",sans-serif;margin:0}
+main{max-width:760px;margin:0 auto;padding:24px 16px 48px}
+h1{font-size:22px;margin:0 0 4px}h2{font-size:17px;margin:28px 0 8px}a{color:inherit}
+.sub{color:var(--mute);font-size:13px}.tw{overflow-x:auto}
+table{border-collapse:collapse;width:100%;font-size:15px}
+th{text-align:left;color:var(--mute);font-weight:400;font-size:13px;border-bottom:2px solid var(--line);padding:4px 8px 4px 0}
+td{padding:6px 8px 6px 0;border-bottom:1px solid var(--line);white-space:nowrap;font-variant-numeric:tabular-nums}
+.up{color:var(--up)}.dn{color:var(--dn)}.key{display:flex;flex-wrap:wrap;gap:4px 14px;font-size:13px}
+.key b{display:inline-block;width:12px;height:3px;vertical-align:middle;margin-right:4px}
+svg text{fill:var(--mute);font-size:19px}svg{color:var(--fg);touch-action:none}
+.pick{appearance:none;-webkit-appearance:none;background-image:linear-gradient(45deg,transparent 50%,currentColor 50%),linear-gradient(135deg,currentColor 50%,transparent 50%)!important;background-position:calc(100% - 18px) 55%,calc(100% - 12px) 55%;background-size:6px 6px;background-repeat:no-repeat;font:inherit;font-size:16px;padding:8px 32px 8px 10px;border:1px solid var(--line);border-radius:8px;background-color:var(--bg);color:var(--fg);width:100%;max-width:360px;margin:8px 0}
+.tip{position:absolute;top:0;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:6px 8px;font-size:13px;white-space:pre;pointer-events:none}
+#sum tr:hover{background:var(--line)}
+</style></head><body><main><h1>美股 US$47,022 模擬帳戶｜10/27</h1><p class="sub">每個策略各自一個 US$47,022 帳戶，從 10/08 開始，全部以美元計價。用下拉選單選策略，圖、總資產、持股都只顯示該策略（虛線是全買大盤對照）；手指在圖上滑動可看每天數值。</p><select id="pick" class="pick" aria-label="選擇策略"></select><div style="position:relative"><svg id="chart" viewBox="0 0 640 260" width="100%" role="img" aria-label="各策略淨值走勢"></svg><div id="tip" class="tip" hidden></div></div><h2>總資產</h2><div class="tw"><table id="sum"><tr><th>策略</th><th>總資產（US$）</th><th>報酬</th><th>對大盤</th><th>最大回撤</th><th>已實現（US$）</th></tr></table></div><h2>持股 <span id="posnote" class="sub"></span></h2><div class="tw"><table id="pos"><tr><th>策略</th><th>股票</th><th>股數</th><th>均價</th><th>報酬</th></tr></table></div><h2>已出場 <span id="closednote" class="sub"></span></h2><div class="tw"><table id="closed"><tr><th>策略</th><th>股票</th><th>買→賣</th><th>買價→賣價</th><th>已實現（US$）</th><th>報酬</th><th>原因</th></tr></table></div><script>
+const COLORS = ["#c8322b", "#0f5e5a", "#b26b00", "#4f6bd8", "#8a2a24", "#15803d", "#7a4fd8", "#5f6b67"], START = 47022, UNIT = "k", DIV = UNIT === "萬" ? 1e4 : 1e3;
+const fmt = v => Math.round(v).toLocaleString(), pc = x => (x > 0 ? "+" : "") + (x * 100).toFixed(2) + "%";
+const cls = x => x > 0 ? "up" : x < 0 ? "dn" : "";
+function parse(t) {
+  const [head, ...lines] = t.trim().split(/\r?\n/);
+  const cols = head.split(",");
+  return lines.map(l => Object.fromEntries(l.split(",").map((v, i) => [cols[i], v])));
+}
+function el(tag, attrs = {}, text) {
+  const e = document.createElementNS(tag === "div" ? "http://www.w3.org/1999/xhtml" : "http://www.w3.org/2000/svg", tag);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+Promise.all(["eq.csv", "pos.csv", "closed.csv"].map(f => fetch(f).then(r => r.ok ? r.text() : ""))).then(([eqT, posT, clT]) => {
+  const eq = parse(eqT), pos = parse(posT), closed = clT ? parse(clT) : [];
+  const realized = {}; closed.forEach(r => realized[r.strategy] = (realized[r.strategy] || 0) + +r.pnl);
+  const names = [...new Set(eq.map(r => r.strategy))], dates = [...new Set(eq.map(r => r.date))].sort();
+  const val = {}; eq.forEach(r => (val[r.strategy] ??= {})[r.date] = +r.value);
+  let picked = null;
+  const svg = document.getElementById("chart"), tip = document.getElementById("tip");
+  const sel = document.getElementById("pick"), sumT = document.getElementById("sum"), posT2 = document.getElementById("pos");
+  function draw() {
+    svg.replaceChildren();
+    const W = 640, H = 260, P = 34, bench = names.filter(n => n.startsWith("全買"));
+    const shown = picked ? [picked, ...bench.filter(n => n !== picked)] : names;
+    const vs = shown.flatMap(n => Object.values(val[n]));
+    if (!vs.length) return;
+    const lo = Math.min(...vs, START), hi = Math.max(...vs, START);
+    const L = 74, x = i => L + i * (W - L - P) / Math.max(dates.length - 1, 1);
+    const y = v => H - P - (v - lo) / ((hi - lo) || 1) * (H - 2 * P);
+    svg.append(el("line", {x1: L, x2: W - P, y1: y(START), y2: y(START), stroke: "currentColor", "stroke-opacity": .25, "stroke-dasharray": "3 3"}));
+    const step = [500, 1e3, 2e3, 5e3, 1e4, 2e4, 5e4, 1e5].find(st => (hi - lo) / st <= 5) || 2e5;
+    for (let t = Math.ceil(lo / step) * step; t <= hi; t += step) {
+      svg.append(el("line", {x1: L, x2: W - P, y1: y(t), y2: y(t), stroke: "currentColor", "stroke-opacity": .08}));
+      svg.append(el("text", {x: L - 6, y: y(t) + 4, "text-anchor": "end"}, (t / DIV).toFixed(DIV === 1e3 && step < 1e3 ? 1 : 0) + UNIT));
+    }
+    svg.append(el("line", {x1: L, x2: L, y1: P, y2: H - P, stroke: "currentColor", "stroke-opacity": .3}));
+    const ticks = [0, Math.floor((dates.length - 1) / 2), dates.length - 1];
+    ticks.forEach((i, k) => svg.append(el("text", {x: x(i), y: H - 10, "text-anchor": ["start", "middle", "end"][k]}, dates[i].slice(5).replace("-", "/"))));
+    shown.forEach(n => {
+      const pts = dates.map((d, i) => val[n][d] === undefined ? null : x(i).toFixed(1) + "," + y(val[n][d]).toFixed(1)).filter(Boolean);
+      svg.append(el("polyline", {points: pts.join(" "), fill: "none", stroke: COLORS[names.indexOf(n) % COLORS.length],
+        "stroke-width": picked === n ? 3 : 1.6, "stroke-dasharray": picked && picked !== n ? "5 4" : ""}));
+    });
+    const guide = el("line", {y1: P, y2: H - P, stroke: "currentColor", "stroke-opacity": 0});
+    svg.append(guide);
+    svg.onpointermove = ev => {
+      const r = svg.getBoundingClientRect(), px = (ev.clientX - r.left) / r.width * W;
+      const i = Math.max(0, Math.min(dates.length - 1, Math.round((px - L) / ((W - L - P) / Math.max(dates.length - 1, 1)))));
+      guide.setAttribute("x1", x(i)); guide.setAttribute("x2", x(i)); guide.setAttribute("stroke-opacity", .4);
+      tip.replaceChildren(el("div", {}, dates[i]));
+      shown.map(n => [n, val[n][dates[i]]]).filter(([, v]) => v !== undefined).sort((a, b) => b[1] - a[1])
+        .forEach(([n, v]) => { const d = el("div", {}, n + "  " + fmt(v) + "  " + pc(v / START - 1)); d.className = cls(v - START); tip.append(d); });
+      tip.hidden = false;
+      tip.style.left = Math.min(ev.clientX - r.left + 12, r.width - tip.offsetWidth) + "px";
+    };
+    svg.onpointerleave = () => { tip.hidden = true; guide.setAttribute("stroke-opacity", 0); };
+  }
+  function tables() {
+    sumT.querySelectorAll("tr:not(:first-child)").forEach(r => r.remove());
+    const last = n => val[n][Object.keys(val[n]).sort().at(-1)];
+    const bench = names.find(n => n.startsWith("全買")), bRet = bench ? last(bench) / START - 1 : 0;
+    const dd = n => { let peak = -Infinity, m = 0; Object.keys(val[n]).sort().forEach(d => { peak = Math.max(peak, val[n][d]); m = Math.min(m, val[n][d] / peak - 1); }); return m; };
+    names.filter(n => !picked || n === picked || n === bench).map(n => [n, last(n)]).sort((a, b) => b[1] - a[1]).forEach(([n, v]) => {
+      const tr = sumT.insertRow(); tr.style.cursor = "pointer"; if (picked === n) tr.style.fontWeight = 700;
+      tr.insertCell().textContent = n; tr.insertCell().textContent = fmt(v);
+      const c = tr.insertCell(); c.textContent = pc(v / START - 1); c.className = cls(v - START);
+      const r = v / START - 1 - bRet, cb = tr.insertCell(); cb.textContent = n === bench ? "—" : pc(r); cb.className = n === bench ? "" : cls(r);
+      tr.insertCell().textContent = pc(dd(n));
+      const rz = tr.insertCell(); if (n !== bench) { rz.textContent = fmt(realized[n] || 0); rz.className = cls(realized[n] || 0); } else rz.textContent = "—";
+      tr.onclick = () => { sel.value = picked === n ? "" : n; sel.onchange(); };
+    });
+    posT2.querySelectorAll("tr:not(:first-child)").forEach(r => r.remove());
+    const ret = r => r.ret === "" ? -Infinity : +r.ret;
+    pos.filter(r => !picked || r.strategy === picked).sort((a, b) => ret(b) - ret(a)).forEach(r => {
+      const tr = posT2.insertRow();
+      [r.strategy, r.stock, (+r.shares).toLocaleString(), r.avg_cost].forEach(t => tr.insertCell().textContent = t);
+      const c = tr.insertCell(); if (r.ret) { c.textContent = pc(+r.ret); c.className = cls(+r.ret); }
+    });
+    const clT2 = document.getElementById("closed");
+    clT2.querySelectorAll("tr:not(:first-child)").forEach(r => r.remove());
+    const cl = closed.filter(r => !picked || r.strategy === picked).sort((a, b) => b.sell_date.localeCompare(a.sell_date));
+    cl.forEach(r => {
+      const tr = clT2.insertRow();
+      [r.strategy, r.stock, r.buy_date.slice(5).replace("-", "/") + "→" + r.sell_date.slice(5).replace("-", "/"), r.cost + "→" + r.price].forEach(t => tr.insertCell().textContent = t);
+      const p = tr.insertCell(); p.textContent = fmt(+r.pnl); p.className = cls(+r.pnl);
+      const c = tr.insertCell(); c.textContent = pc(+r.ret); c.className = cls(+r.ret);
+      tr.insertCell().textContent = r.why;
+    });
+    document.getElementById("closednote").textContent = cl.length ? "（" + (picked || "全部策略") + "，共 " + cl.length + " 筆，新到舊；只列個股，損益未扣手續費與稅）" : "（尚無）";
+    document.getElementById("posnote").textContent = "（" + (picked || "全部策略") + "，損益高到低）";
+  }
+  sel.append(new Option("全部策略", ""));
+  names.forEach(n => sel.append(new Option(n, n)));
+  sel.onchange = () => { picked = sel.value || null; draw(); tables(); };
+  draw(); tables();
+}).catch(e => { document.getElementById("posnote").textContent = "資料讀取失敗：" + e; });
+</script><p class="sub">僅供研究，非投資建議。<a href="https://selfuse20261001-cell.github.io/PTEST/">回首頁</a></p></main></body></html>
